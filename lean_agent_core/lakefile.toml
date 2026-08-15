@@ -1,0 +1,14 @@
+name = "lean_agent_core"
+version = "0.1.0"
+defaultTargets = ["lean_agent_core"]
+
+[[lean_lib]]
+name = "LeanAgentCore"
+
+[[lean_exe]]
+name = "lean_agent_core"
+root = "Main"
+
+[[lean_exe]]
+name = "lean_agent_core_tests"
+root = "Tests"
