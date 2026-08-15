@@ -15,8 +15,12 @@ use agent_plugin_protocol::{
     ToolResult, ToolSpec, read_response, write_request,
 };
 use clap::{Parser, ValueEnum};
+use crossterm::cursor::Show;
 use crossterm::{
-    event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -29,10 +33,10 @@ use nix::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
+    layout::{Alignment, Constraint, Layout},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -52,6 +56,13 @@ const CORE_PROTOCOL_VERSION: u64 = 1;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const COLOR_ACCENT: Color = Color::Rgb(139, 92, 246);
+const COLOR_USER: Color = Color::Rgb(56, 189, 248);
+const COLOR_ASSISTANT: Color = Color::Rgb(74, 222, 128);
+const COLOR_TOOL: Color = Color::Rgb(250, 204, 21);
+const COLOR_TEXT: Color = Color::Rgb(228, 228, 231);
+const COLOR_MUTED: Color = Color::Rgb(113, 113, 122);
+const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Provider {
@@ -72,6 +83,8 @@ struct Args {
     model: String,
     #[arg(long)]
     plugin: PathBuf,
+    #[arg(long)]
+    git_plugin: Option<PathBuf>,
     #[arg(long)]
     core: Option<PathBuf>,
     #[arg(long)]
@@ -114,6 +127,26 @@ struct CoreToolCall {
     call_id: String,
     name: String,
     arguments: Value,
+}
+
+impl CoreToolCall {
+    fn display_label(&self) -> &str {
+        if self.name == "git_read" || self.name == "git_write" {
+            self.arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or(&self.name)
+        } else {
+            &self.name
+        }
+    }
+
+    fn transcript_summary(&self) -> String {
+        match self.arguments.get("command").and_then(Value::as_str) {
+            Some(command) => format!("{}  {command}", self.name),
+            None => format!("{}  {}", self.name, self.arguments),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -406,6 +439,10 @@ enum PluginClientError {
     Retired,
     #[error("plugin tool catalogue changed after restart")]
     CatalogueChanged,
+    #[error("no plugin declared tool {0}")]
+    UnknownTool(String),
+    #[error("multiple plugins declared tool {0}")]
+    DuplicateToolAcrossPlugins(String),
 }
 
 struct PluginClient {
@@ -576,6 +613,101 @@ impl PluginClient {
             return;
         }
         self.kill_tree().await;
+    }
+}
+
+struct ManagedPlugin {
+    path: PathBuf,
+    expected_tool_names: Vec<String>,
+    client: PluginClient,
+}
+
+struct PluginManager {
+    plugins: Vec<ManagedPlugin>,
+    routes: BTreeMap<String, usize>,
+    model_tools: Vec<ToolSpec>,
+}
+
+impl PluginManager {
+    async fn spawn(workspace: &Path, git: &Path) -> Result<Self, PluginClientError> {
+        let declarations = [(workspace, true), (git, false)];
+        let mut plugins = Vec::with_capacity(declarations.len());
+        let mut routes = BTreeMap::new();
+        let mut model_tools = Vec::new();
+        for (path, expose_to_model) in declarations {
+            let client = PluginClient::spawn(path).await?;
+            let plugin_index = plugins.len();
+            let expected_tool_names = client.tools.iter().map(|tool| tool.name.clone()).collect();
+            for tool in &client.tools {
+                if routes.insert(tool.name.clone(), plugin_index).is_some() {
+                    return Err(PluginClientError::DuplicateToolAcrossPlugins(
+                        tool.name.clone(),
+                    ));
+                }
+                if expose_to_model {
+                    model_tools.push(tool.clone());
+                }
+            }
+            plugins.push(ManagedPlugin {
+                path: path.to_path_buf(),
+                expected_tool_names,
+                client,
+            });
+        }
+        Ok(Self {
+            plugins,
+            routes,
+            model_tools,
+        })
+    }
+
+    fn model_tools(&self) -> &[ToolSpec] {
+        &self.model_tools
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        self.routes.contains_key(name)
+    }
+
+    async fn ensure_plugin(&mut self, index: usize) -> Result<(), PluginClientError> {
+        if self.plugins[index].client.available {
+            return Ok(());
+        }
+        let path = self.plugins[index].path.clone();
+        let expected_names = self.plugins[index].expected_tool_names.clone();
+        let replacement = PluginClient::spawn(&path).await?;
+        let replacement_names: Vec<String> = replacement
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        if replacement_names != expected_names {
+            return Err(PluginClientError::CatalogueChanged);
+        }
+        self.plugins[index].client = replacement;
+        Ok(())
+    }
+
+    async fn call(&mut self, call: &CoreToolCall) -> Result<ToolResult, PluginClientError> {
+        let index = self
+            .routes
+            .get(&call.name)
+            .copied()
+            .ok_or_else(|| PluginClientError::UnknownTool(call.name.clone()))?;
+        self.ensure_plugin(index).await?;
+        self.plugins[index].client.call(call).await
+    }
+
+    async fn retire(&mut self) {
+        for plugin in &mut self.plugins {
+            plugin.client.retire().await;
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        for plugin in &mut self.plugins {
+            plugin.client.shutdown().await;
+        }
     }
 }
 
@@ -990,6 +1122,12 @@ struct App {
     snapshot: CoreSnapshot,
     approval: Option<CoreToolCall>,
     busy: bool,
+    scroll_offset: u16,
+    max_scroll: u16,
+    page_rows: u16,
+    follow_tail: bool,
+    transcript_top: u16,
+    transcript_bottom: u16,
 }
 
 impl App {
@@ -1000,36 +1138,102 @@ impl App {
             snapshot,
             approval: None,
             busy: false,
+            scroll_offset: 0,
+            max_scroll: 0,
+            page_rows: 1,
+            follow_tail: true,
+            transcript_top: 0,
+            transcript_bottom: 0,
         }
     }
 
     fn transcript(&self) -> Text<'static> {
         let mut lines = Vec::new();
         for message in &self.snapshot.messages {
-            let color = match message.role.as_str() {
-                "user" => Color::Cyan,
-                "assistant" => Color::Green,
-                "tool" if message.is_error => Color::Red,
-                "tool" => Color::Yellow,
-                _ => Color::Gray,
+            let (label, color, content_color) = match message.role.as_str() {
+                "user" => ("› You", COLOR_USER, COLOR_TEXT),
+                "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
+                "tool" if message.is_error => ("! Tool error", COLOR_ERROR, COLOR_ERROR),
+                "tool" => ("└ Tool result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
+                _ => ("· Message", COLOR_MUTED, COLOR_TEXT),
             };
-            let label = message.role.to_uppercase();
             lines.push(Line::from(Span::styled(
-                format!("{label}: "),
-                Style::default().fg(color),
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
             if !message.content.is_empty() {
-                lines.push(Line::from(message.content.clone()));
+                for content in message.content.split('\n') {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(content.to_owned(), Style::default().fg(content_color)),
+                    ]));
+                }
             }
             for call in &message.tool_calls {
-                lines.push(Line::from(Span::styled(
-                    format!("tool {} {}({})", call.call_id, call.name, call.arguments),
-                    Style::default().fg(Color::Magenta),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("  └─ ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(call.transcript_summary(), Style::default().fg(COLOR_ACCENT)),
+                    Span::styled(
+                        format!("  #{}", call.call_id),
+                        Style::default().fg(COLOR_MUTED),
+                    ),
+                ]));
             }
-            lines.push(Line::from(""));
+            lines.push(Line::default());
         }
         Text::from(lines)
+    }
+
+    fn scroll_up(&mut self, rows: u16) {
+        if self.max_scroll == 0 {
+            return;
+        }
+        let current = if self.follow_tail {
+            self.max_scroll
+        } else {
+            self.scroll_offset
+        };
+        self.scroll_offset = current.saturating_sub(rows.max(1));
+        self.follow_tail = false;
+    }
+
+    fn scroll_down(&mut self, rows: u16) {
+        let current = if self.follow_tail {
+            self.max_scroll
+        } else {
+            self.scroll_offset
+        };
+        self.scroll_offset = current.saturating_add(rows.max(1)).min(self.max_scroll);
+        self.follow_tail = self.scroll_offset == self.max_scroll;
+    }
+
+    fn page_up(&mut self) {
+        self.scroll_up(self.page_rows.saturating_sub(1).max(1));
+    }
+
+    fn page_down(&mut self) {
+        self.scroll_down(self.page_rows.saturating_sub(1).max(1));
+    }
+
+    fn scroll_home(&mut self) {
+        self.scroll_offset = 0;
+        self.follow_tail = self.max_scroll == 0;
+    }
+
+    fn scroll_end(&mut self) {
+        self.scroll_offset = self.max_scroll;
+        self.follow_tail = true;
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) {
+        if event.row < self.transcript_top || event.row >= self.transcript_bottom {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
+            _ => {}
+        }
     }
 }
 
@@ -1064,30 +1268,8 @@ enum KeyAction {
 
 struct RuntimeResources {
     core: CoreClient,
-    plugin: PluginClient,
-    plugin_path: PathBuf,
+    plugins: PluginManager,
     provider: ModelClient,
-    tool_names: Vec<String>,
-}
-
-impl RuntimeResources {
-    async fn ensure_plugin(&mut self) -> Result<(), AppError> {
-        if self.plugin.available {
-            return Ok(());
-        }
-        let replacement = PluginClient::spawn(&self.plugin_path).await?;
-        let replacement_names: Vec<&str> = replacement
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        let expected_names: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
-        if replacement_names != expected_names {
-            return Err(PluginClientError::CatalogueChanged.into());
-        }
-        self.plugin = replacement;
-        Ok(())
-    }
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeResources>>;
@@ -1097,8 +1279,23 @@ struct ActiveRuntime {
     cancel: CancellationToken,
 }
 
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
+}
+
+fn install_terminal_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal();
+        previous(panic_info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
+    install_terminal_panic_hook();
     let args = Args::parse();
     let session = args.session.clone();
     if let Some(path) = &session {
@@ -1106,15 +1303,21 @@ async fn main() -> Result<(), AppError> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let core_path = args.core.clone().unwrap_or_else(default_core_path);
+    let git_plugin_path = args
+        .git_plugin
+        .clone()
+        .unwrap_or_else(default_git_plugin_path);
     let mut core = CoreClient::spawn(&core_path, session.as_deref()).await?;
-    let plugin = PluginClient::spawn(&args.plugin).await?;
-    let safe_tools: Vec<String> = plugin
-        .tools
+    let plugins = PluginManager::spawn(&args.plugin, &git_plugin_path).await?;
+    let mut safe_tools: Vec<String> = plugins
+        .model_tools()
         .iter()
         .filter(|tool| tool.name == "read")
         .map(|tool| tool.name.clone())
         .collect();
-    let tool_names = plugin.tools.iter().map(|tool| tool.name.clone()).collect();
+    if plugins.has_tool("git_read") {
+        safe_tools.push("git_read".to_owned());
+    }
     let provider = ModelClient::from_args(&args).await?;
     let initial = core.snapshot().await?;
     let mut app = App::new(initial.snapshot);
@@ -1149,7 +1352,7 @@ async fn main() -> Result<(), AppError> {
                 });
             }
             let call = active_pending_call(&app.snapshot)?;
-            app.status = format!("Approve {}? [y]es / [n]o", call.name);
+            app.status = format!("Approve {}? [y]es / [n]o", call.display_label());
             app.approval = Some(call);
             None
         }
@@ -1178,15 +1381,13 @@ async fn main() -> Result<(), AppError> {
     };
     let runtime = Arc::new(Mutex::new(RuntimeResources {
         core,
-        plugin,
-        plugin_path: args.plugin.clone(),
+        plugins,
         provider,
-        tool_names,
     }));
     run_tui(&mut app, Arc::clone(&runtime), initial_action).await?;
     let mut runtime = runtime.lock().await;
     let _ = runtime.core.shutdown().await;
-    runtime.plugin.shutdown().await;
+    runtime.plugins.shutdown().await;
     Ok(())
 }
 
@@ -1203,21 +1404,36 @@ fn active_pending_call(snapshot: &CoreSnapshot) -> Result<CoreToolCall, AppError
         .ok_or(AppError::MissingPendingTool { phase })
 }
 
+struct TerminalRestore;
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 async fn run_tui(
     app: &mut App,
     runtime: SharedRuntime,
     initial_action: Option<RuntimeAction>,
 ) -> Result<(), AppError> {
     enable_raw_mode()?;
+    let restore = TerminalRestore;
     let mut terminal_stdout = std::io::stdout();
-    execute!(terminal_stdout, EnterAlternateScreen)?;
+    execute!(terminal_stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(terminal_stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = tui_loop(&mut terminal, app, runtime, initial_action).await;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let cursor_result = terminal.show_cursor();
+    drop(terminal);
+    drop(restore);
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            cursor_result?;
+            Ok(())
+        }
+    }
 }
 
 async fn tui_loop(
@@ -1272,6 +1488,7 @@ async fn tui_loop(
                             KeyAction::Submit(_) | KeyAction::Approval { .. } => {}
                         }
                     }
+                    CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse),
                     CrosstermEvent::Resize(_, _) => {}
                     _ => {}
                 }
@@ -1309,6 +1526,33 @@ async fn tui_loop(
 fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return KeyAction::Quit;
+    }
+    match key.code {
+        KeyCode::Up => {
+            app.scroll_up(1);
+            return KeyAction::None;
+        }
+        KeyCode::Down => {
+            app.scroll_down(1);
+            return KeyAction::None;
+        }
+        KeyCode::PageUp => {
+            app.page_up();
+            return KeyAction::None;
+        }
+        KeyCode::PageDown => {
+            app.page_down();
+            return KeyAction::None;
+        }
+        KeyCode::Home => {
+            app.scroll_home();
+            return KeyAction::None;
+        }
+        KeyCode::End => {
+            app.scroll_end();
+            return KeyAction::None;
+        }
+        _ => {}
     }
     if app.busy && matches!(key.code, KeyCode::Esc) {
         return KeyAction::Cancel;
@@ -1410,7 +1654,7 @@ async fn drive_response(
                 send_runtime_progress(updates, &snapshot, "Waiting for model…");
                 let completion = tokio::select! {
                     () = cancel.cancelled() => return cancel_runtime(runtime).await,
-                    result = runtime.provider.complete(&snapshot, &runtime.plugin.tools) => result?,
+                    result = runtime.provider.complete(&snapshot, runtime.plugins.model_tools()) => result?,
                 };
                 let next = runtime
                     .core
@@ -1428,7 +1672,7 @@ async fn drive_response(
                 })?;
                 return Ok(RuntimeFinal {
                     snapshot,
-                    status: format!("Approve {}? [y]es / [n]o", call.name),
+                    status: format!("Approve {}? [y]es / [n]o", call.display_label()),
                     approval: Some(call),
                 });
             }
@@ -1436,11 +1680,14 @@ async fn drive_response(
                 let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
                     kind: "invoke_tool".to_owned(),
                 })?;
-                runtime.ensure_plugin().await?;
-                send_runtime_progress(updates, &snapshot, &format!("Running {}…", call.name));
+                send_runtime_progress(
+                    updates,
+                    &snapshot,
+                    &format!("Running {}…", call.display_label()),
+                );
                 let tool_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = runtime.plugin.call(&call) => Some(result),
+                    result = runtime.plugins.call(&call) => Some(result),
                 };
                 let Some(tool_result) = tool_result else {
                     return cancel_runtime(runtime).await;
@@ -1467,7 +1714,7 @@ async fn drive_response(
 }
 
 async fn cancel_runtime(runtime: &mut RuntimeResources) -> Result<RuntimeFinal, AppError> {
-    runtime.plugin.retire().await;
+    runtime.plugins.retire().await;
     let response = runtime.core.event(&CoreEvent::abort()).await?;
     Ok(RuntimeFinal {
         snapshot: response.snapshot,
@@ -1504,7 +1751,7 @@ async fn cancel_and_wait(active: &mut Option<ActiveRuntime>, app: &mut App) {
     let _ = active.handle.await;
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let [header, transcript, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -1512,39 +1759,112 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let pending = app.snapshot.pending_calls.len();
-    let safe = app.snapshot.safe_tools.len();
-    let approval = app
-        .approval
-        .as_ref()
-        .map(|call| format!(" approval: {}", call.name))
-        .unwrap_or_default();
+
+    let phase_color = match app.snapshot.phase.as_str() {
+        "idle" => COLOR_ASSISTANT,
+        "waiting_approval" => COLOR_TOOL,
+        "waiting_model" | "waiting_tool" => COLOR_ACCENT,
+        _ => COLOR_MUTED,
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "Lean Coding Agent · phase: {} · pending: {pending} · active: {} · safe tools: {safe}{approval}",
-            app.snapshot.phase, app.snapshot.current_call
-        ))
-        .style(Style::default().fg(Color::Blue)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " lean-coding-agent ",
+                Style::default()
+                    .fg(COLOR_TEXT)
+                    .bg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                app.snapshot.phase.clone(),
+                Style::default()
+                    .fg(phase_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
         header,
     );
+
+    let transcript_block = Block::default().padding(Padding::horizontal(1));
+    let transcript_paragraph = Paragraph::new(app.transcript())
+        .block(transcript_block)
+        .wrap(Wrap { trim: false });
+    let rendered_lines = transcript_paragraph.line_count(transcript.width.saturating_sub(2));
+    let content_height = transcript.height;
+    app.max_scroll = u16::try_from(rendered_lines.saturating_sub(usize::from(content_height)))
+        .unwrap_or(u16::MAX);
+    app.page_rows = content_height.max(1);
+    app.transcript_top = transcript.y;
+    app.transcript_bottom = transcript.y.saturating_add(transcript.height);
+    if app.follow_tail {
+        app.scroll_offset = app.max_scroll;
+    } else {
+        app.scroll_offset = app.scroll_offset.min(app.max_scroll);
+    }
     frame.render_widget(
-        Paragraph::new(app.transcript())
-            .block(Block::default().borders(Borders::ALL).title("Transcript"))
-            .wrap(Wrap { trim: false }),
+        transcript_paragraph.scroll((app.scroll_offset, 0)),
         transcript,
     );
-    let input_title = if app.approval.is_some() {
-        "Approval is pending"
-    } else {
-        "Prompt"
+
+    let (input_title, input_color) = match app.approval.as_ref() {
+        Some(call) => (
+            format!(" Approval · {} · y allow · n deny ", call.display_label()),
+            COLOR_TOOL,
+        ),
+        None if app.busy => (" Message · Esc cancel ".to_owned(), COLOR_ACCENT),
+        None => (" Message · Enter send ".to_owned(), COLOR_MUTED),
     };
     frame.render_widget(
         Paragraph::new(app.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(input_title)),
+            .style(Style::default().fg(COLOR_TEXT))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(input_color))
+                    .title(Span::styled(
+                        input_title,
+                        Style::default()
+                            .fg(input_color)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            ),
         input,
     );
+
+    let status_color = if app.status.contains("failed") || app.status.contains("error") {
+        COLOR_ERROR
+    } else if app.status == "Ready" {
+        COLOR_ASSISTANT
+    } else if app.busy {
+        COLOR_TOOL
+    } else {
+        COLOR_MUTED
+    };
+    let scroll = if app.max_scroll == 0 {
+        String::new()
+    } else {
+        format!(" · view {}/{}", app.scroll_offset, app.max_scroll)
+    };
     frame.render_widget(
-        Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {}", app.status),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " · pending {} · safe {}{scroll}",
+                    app.snapshot.pending_calls.len(),
+                    app.snapshot.safe_tools.len()
+                ),
+                Style::default().fg(COLOR_MUTED),
+            ),
+        ]))
+        .alignment(Alignment::Left),
         status,
     );
 }
@@ -1557,9 +1877,22 @@ fn default_core_path() -> PathBuf {
         .join("../../lean_agent_core/.lake/build/bin/lean_agent_core")
 }
 
+fn default_git_plugin_path() -> PathBuf {
+    if let Some(path) = env::var_os("LEAN_AGENT_GIT_PLUGIN_BIN") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/agent-git-plugin")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CoreMessage, anthropic_messages, parse_openai_tool_calls};
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::{
+        App, CoreMessage, CoreSnapshot, CoreToolCall, anthropic_messages, draw,
+        parse_openai_tool_calls,
+    };
 
     #[test]
     fn parses_complete_openai_function_calls() {
@@ -1598,5 +1931,204 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn displays_original_command_for_lowered_git_calls() {
+        let call = CoreToolCall {
+            call_id: "call_git".to_owned(),
+            name: "git_write".to_owned(),
+            arguments: serde_json::json!({
+                "operation": "add",
+                "arguments": ["Main.lean"],
+                "command": "git add -- Main.lean"
+            }),
+        };
+        assert_eq!(call.display_label(), "git add -- Main.lean");
+    }
+
+    #[test]
+    fn refreshed_layout_renders_semantic_message_hierarchy() {
+        let snapshot = CoreSnapshot {
+            phase: "idle".to_owned(),
+            messages: vec![
+                CoreMessage {
+                    role: "user".to_owned(),
+                    content: "Inspect the repository".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    tool_calls: vec![CoreToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "bash".to_owned(),
+                        arguments: serde_json::json!({"command": "git status --short"}),
+                    }],
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "tool".to_owned(),
+                    content: "M Cargo.toml".to_owned(),
+                    tool_call_id: Some("call_1".to_owned()),
+                    ..CoreMessage::default()
+                },
+            ],
+            safe_tools: vec!["read".to_owned(), "git_read".to_owned()],
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot);
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("refreshed frame must draw");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "lean-coding-agent",
+            "› You",
+            "• Assistant",
+            "└─ bash  git status --short",
+            "└ Tool result",
+            "Message · Enter send",
+            "Ready · pending 0 · safe 2",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "screen must contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_navigation_leaves_and_restores_tail_following() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.max_scroll = 20;
+        app.page_rows = 6;
+        app.scroll_offset = 20;
+
+        app.scroll_up(1);
+        assert_eq!(app.scroll_offset, 19);
+        assert!(!app.follow_tail);
+
+        app.page_up();
+        assert_eq!(app.scroll_offset, 14);
+
+        app.page_down();
+        app.scroll_down(1);
+        assert_eq!(app.scroll_offset, 20);
+        assert!(app.follow_tail);
+
+        app.scroll_home();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.follow_tail);
+        app.scroll_end();
+        assert_eq!(app.scroll_offset, 20);
+        assert!(app.follow_tail);
+    }
+
+    #[test]
+    fn mouse_wheel_only_scrolls_over_transcript() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.max_scroll = 20;
+        app.scroll_offset = 20;
+        app.transcript_top = 2;
+        app.transcript_bottom = 12;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll_offset, 17);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll_offset, 17);
+    }
+
+    #[test]
+    fn padded_transcript_counts_the_rendered_wrap_width() {
+        let snapshot = CoreSnapshot {
+            messages: vec![
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "12345678901234567".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "tail".to_owned(),
+                    ..CoreMessage::default()
+                },
+            ],
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot);
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("padded transcript must draw");
+
+        let rendered_lines = 7_u16;
+        assert_eq!(app.max_scroll, rendered_lines.saturating_sub(app.page_rows));
+        assert_eq!(app.scroll_offset, app.max_scroll);
+        assert!(app.follow_tail);
+    }
+
+    #[test]
+    fn drawing_follows_tail_until_user_scrolls_up() {
+        let snapshot = CoreSnapshot {
+            messages: (0..24)
+                .map(|index| CoreMessage {
+                    role: if index % 2 == 0 { "user" } else { "assistant" }.to_owned(),
+                    content: format!("message {index}: {}", "wrapped content ".repeat(5)),
+                    ..CoreMessage::default()
+                })
+                .collect(),
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot);
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("initial frame must draw");
+        let initial_max = app.max_scroll;
+        assert!(initial_max > 0);
+        assert_eq!(app.scroll_offset, initial_max);
+
+        app.scroll_up(3);
+        let pinned_offset = app.scroll_offset;
+        app.snapshot.messages.push(CoreMessage {
+            role: "assistant".to_owned(),
+            content: "new tail content".repeat(8),
+            ..CoreMessage::default()
+        });
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("scrolled frame must draw");
+        assert!(app.max_scroll > initial_max);
+        assert_eq!(app.scroll_offset, pinned_offset);
+
+        app.scroll_end();
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("tail frame must draw");
+        assert_eq!(app.scroll_offset, app.max_scroll);
+        assert!(app.follow_tail);
     }
 }

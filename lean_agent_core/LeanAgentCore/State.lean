@@ -1,4 +1,4 @@
-import LeanAgentCore.Protocol
+import LeanAgentCore.Git
 
 namespace LeanAgentCore
 
@@ -83,7 +83,10 @@ public def transition (state : State) (event : Event) : Except String (State × 
       if event.toolCalls.isEmpty then
         pure ({ withAssistant with phase := .idle }, #[])
       else
-        pure <| advance { withAssistant with pendingCalls := event.toolCalls, currentCall := 0 }
+        let pendingCalls :=
+          if state.safeTools.any (· == "git_read") then lowerGitToolCalls event.toolCalls
+          else event.toolCalls
+        pure <| advance { withAssistant with pendingCalls, currentCall := 0 }
     | _ => throw "model_completed arrived without an active model request"
   | "approval_result" =>
     match state.phase with

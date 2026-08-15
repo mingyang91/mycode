@@ -17,6 +17,12 @@ private def call (callId name : String) : ToolCall := {
   arguments := Json.mkObj []
 }
 
+private def bashCall (callId command : String) : ToolCall := {
+  callId
+  name := "bash"
+  arguments := Json.mkObj [("command", toJson command)]
+}
+
 private def testSafeToolFlowsDirectlyToExecutor : IO Unit := do
   let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read"] }
   let (submitted, submitEffects) ← step configured { kind := "submit", text? := some "Inspect Main.lean" }
@@ -75,9 +81,60 @@ private def testAbortClosesEveryPendingToolCall : IO Unit := do
   assert (resubmitted.phase.label == "waiting_model") "session must accept a prompt after abort"
   assert (nextEffects.size == 1 && nextEffects[0]!.kind == "request_model") "resubmit must request the model"
 
+private def testReadOnlyGitUsesVerifiedEffect : IO Unit := do
+  let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read", "git_read"] }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Inspect the repository" }
+  let (awaitingTool, effects) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-git-read" "git status --short"]
+  }
+  assert (awaitingTool.phase.label == "waiting_tool") "read-only Git must skip approval"
+  assert (awaitingTool.pendingCalls[0]!.name == "git_read") "Git status must lower to git_read"
+  assert (effects[0]!.call?.map (·.name) == some "git_read") "executor must receive the lowered Git call"
+
+private def testMutatingGitRequiresApproval : IO Unit := do
+  let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read", "git_read"] }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Stage Main.lean" }
+  let (awaitingApproval, effects) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-git-write" "git add -- Main.lean"]
+  }
+  assert (awaitingApproval.phase.label == "waiting_approval") "mutating Git must require approval"
+  assert (awaitingApproval.pendingCalls[0]!.name == "git_write") "Git add must lower to git_write"
+  assert (effects[0]!.call?.map (·.name) == some "git_write") "approval must carry the lowered Git call"
+
+private def testCompoundGitFallsBackToBash : IO Unit := do
+  let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read", "git_read"] }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Inspect and reset" }
+  let (awaitingApproval, _) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-git-compound" "git status && git reset --hard"]
+  }
+  assert (awaitingApproval.pendingCalls[0]!.name == "bash") "compound shell input must not be misclassified"
+
+private def testGitStaysInBashWithoutCapability : IO Unit := do
+  let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read"] }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Inspect the repository" }
+  let (awaitingApproval, _) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-no-git" "git status --short"]
+  }
+  assert (awaitingApproval.pendingCalls[0]!.name == "bash")
+    "Git must stay in bash when no Git plugin capability was configured"
+
+private def testQuotedCommitMessageParses : IO Unit := do
+  match parseGitCommand "git commit -m \"verified commit\"" with
+  | some (.commit message) => assert (message == "verified commit") "quoted commit message must be preserved"
+  | _ => throw (IO.userError "quoted Git commit must parse")
+
 def main : IO Unit := do
   testSafeToolFlowsDirectlyToExecutor
   testUnsafeToolNeedsApproval
   testDeniedToolReturnsToModel
   testAbortClosesEveryPendingToolCall
+  testReadOnlyGitUsesVerifiedEffect
+  testMutatingGitRequiresApproval
+  testCompoundGitFallsBackToBash
+  testGitStaysInBashWithoutCapability
+  testQuotedCommitMessageParses
   IO.println "Lean agent core tests passed"
