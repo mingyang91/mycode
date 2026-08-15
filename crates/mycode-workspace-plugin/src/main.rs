@@ -3,17 +3,21 @@
 
 use std::{
     env,
+    fs::File,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
+use ignore::WalkBuilder;
 use mycode_plugin_protocol::{
     CallToolParams, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_TOOL_OUTPUT_BYTES, EmptyParams,
     InitializeResult, PluginErrorCode, PluginIdentity, ProtocolRange, RequestEnvelope,
     RequestOperation, ResponseEnvelope, ToolListResult, ToolResult, ToolSpec, read_request,
     tool_failure, write_response,
 };
+use regex::RegexBuilder;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
@@ -26,6 +30,12 @@ use uuid::Uuid;
 const MAX_BASH_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const MAX_EDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GREP_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_GREP_REGEX_BYTES: usize = 1024 * 1024;
+const MAX_GREP_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GREP_LINE_BYTES: usize = 4 * 1024;
+const DEFAULT_GREP_RESULTS: usize = 200;
+const MAX_GREP_RESULTS: usize = 1000;
 
 #[derive(Debug, Error)]
 enum WorkspaceError {
@@ -33,6 +43,10 @@ enum WorkspaceError {
     MissingStringArgument { name: &'static str },
     #[error("argument timeoutMs must be an integer between 1 and {MAX_BASH_TIMEOUT_MS}")]
     InvalidTimeout,
+    #[error("argument {name} must be a boolean")]
+    InvalidBooleanArgument { name: &'static str },
+    #[error("argument maxResults must be an integer between 1 and {MAX_GREP_RESULTS}")]
+    InvalidMaxResults,
     #[error("path must be a non-empty relative path")]
     InvalidRelativePath,
     #[error("path resolves outside the configured workspace")]
@@ -41,6 +55,12 @@ enum WorkspaceError {
     MissingParent,
     #[error("tool is not declared by this plugin")]
     UnknownTool,
+    #[error("grep pattern must not be empty")]
+    EmptyGrepPattern,
+    #[error("grep pattern exceeds {MAX_GREP_PATTERN_BYTES} bytes")]
+    GrepPatternTooLong,
+    #[error("grep pattern is invalid: {0}")]
+    InvalidGrepPattern(#[source] regex::Error),
     #[error("file content is not valid UTF-8")]
     InvalidUtf8,
     #[error("the expected text must occur exactly once")]
@@ -51,6 +71,10 @@ enum WorkspaceError {
     MissingChildPipe,
     #[error("shell command exceeded its deadline")]
     CommandTimedOut,
+    #[error("workspace search traversal failed: {0}")]
+    Walk(#[from] ignore::Error),
+    #[error("workspace search task failed: {0}")]
+    SearchTask(#[from] tokio::task::JoinError),
     #[error("filesystem or process operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -173,6 +197,26 @@ fn tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "grep".to_owned(),
+            description: "Search UTF-8 workspace files with a Rust regular expression. Read-only and respects ignore files.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "default": "."},
+                    "caseSensitive": {"type": "boolean", "default": true},
+                    "maxResults": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_GREP_RESULTS,
+                        "default": DEFAULT_GREP_RESULTS
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
             name: "write".to_owned(),
             description: "Replace a UTF-8 text file inside the workspace. Requires approval.".to_owned(),
             input_schema: json!({
@@ -216,6 +260,9 @@ async fn execute_tool(
     workspace: &Path,
     call: CallToolParams,
 ) -> Result<ToolResult, WorkspaceError> {
+    if call.name == "grep" {
+        return grep_files(workspace, &call.arguments).await;
+    }
     let output = match call.name.as_str() {
         "read" => read_file(workspace, &call.arguments).await?,
         "write" => write_file(workspace, &call.arguments).await?,
@@ -231,6 +278,116 @@ async fn read_file(workspace: &Path, arguments: &Value) -> Result<String, Worksp
     let file = tokio::fs::File::open(path).await?;
     let bytes = read_bounded(file, DEFAULT_MAX_TOOL_OUTPUT_BYTES).await?;
     String::from_utf8(bytes).map_err(|_| WorkspaceError::InvalidUtf8)
+}
+async fn grep_files(workspace: &Path, arguments: &Value) -> Result<ToolResult, WorkspaceError> {
+    let pattern = required_string(arguments, "pattern")?;
+    if pattern.is_empty() {
+        return Err(WorkspaceError::EmptyGrepPattern);
+    }
+    if pattern.len() > MAX_GREP_PATTERN_BYTES {
+        return Err(WorkspaceError::GrepPatternTooLong);
+    }
+    let path = existing_path(
+        workspace,
+        optional_string(arguments, "path")?.unwrap_or("."),
+    )
+    .await?;
+    let case_sensitive = optional_bool(arguments, "caseSensitive", true)?;
+    let max_results = optional_grep_results(arguments)?;
+    let workspace = workspace.to_owned();
+    let pattern = pattern.to_owned();
+    tokio::task::spawn_blocking(move || {
+        search_files(&workspace, &path, &pattern, case_sensitive, max_results)
+    })
+    .await?
+}
+
+fn search_files(
+    workspace: &Path,
+    root: &Path,
+    pattern: &str,
+    case_sensitive: bool,
+    max_results: usize,
+) -> Result<ToolResult, WorkspaceError> {
+    let expression = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .size_limit(MAX_GREP_REGEX_BYTES)
+        .dfa_size_limit(MAX_GREP_REGEX_BYTES)
+        .build()
+        .map_err(WorkspaceError::InvalidGrepPattern)?;
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .standard_filters(true)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_path(|left, right| left.cmp(right));
+    let mut output = String::new();
+    let mut matches = 0_usize;
+    let mut truncated = false;
+
+    'entries: for entry in walker.build() {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let file = File::open(entry.path())?;
+        let mut bytes = Vec::with_capacity(8192);
+        file.take((MAX_GREP_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_GREP_FILE_BYTES {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let relative = entry
+            .path()
+            .strip_prefix(workspace)
+            .map_err(|_| WorkspaceError::PathEscapesWorkspace)?;
+        for (line_index, line) in content.lines().enumerate() {
+            if !expression.is_match(line) {
+                continue;
+            }
+            if matches == max_results {
+                truncated = true;
+                break 'entries;
+            }
+            let (line, line_truncated) = grep_line_fragment(line);
+            let suffix = if line_truncated { "…" } else { "" };
+            let record = format!("{}:{}:{line}{suffix}", relative.display(), line_index + 1);
+            let separator_bytes = usize::from(!output.is_empty());
+            if output
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(record.len())
+                > DEFAULT_MAX_TOOL_OUTPUT_BYTES
+            {
+                truncated = true;
+                break 'entries;
+            }
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&record);
+            matches += 1;
+            truncated |= line_truncated;
+        }
+    }
+    if output.is_empty() {
+        output.push_str("No matches.");
+    }
+    Ok(ToolResult { output, truncated })
+}
+
+fn grep_line_fragment(line: &str) -> (&str, bool) {
+    if line.len() <= MAX_GREP_LINE_BYTES {
+        return (line, false);
+    }
+    let mut end = MAX_GREP_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&line[..end], true)
 }
 
 async fn write_file(workspace: &Path, arguments: &Value) -> Result<String, WorkspaceError> {
@@ -362,6 +519,42 @@ fn required_string<'a>(
         .and_then(Value::as_str)
         .ok_or(WorkspaceError::MissingStringArgument { name })
 }
+fn optional_string<'a>(
+    arguments: &'a Value,
+    name: &'static str,
+) -> Result<Option<&'a str>, WorkspaceError> {
+    match arguments.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or(WorkspaceError::MissingStringArgument { name }),
+    }
+}
+
+fn optional_bool(
+    arguments: &Value,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, WorkspaceError> {
+    match arguments.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or(WorkspaceError::InvalidBooleanArgument { name }),
+    }
+}
+
+fn optional_grep_results(arguments: &Value) -> Result<usize, WorkspaceError> {
+    match arguments.get("maxResults") {
+        None => Ok(DEFAULT_GREP_RESULTS),
+        Some(value) => value
+            .as_u64()
+            .and_then(|results| usize::try_from(results).ok())
+            .filter(|results| (1..=MAX_GREP_RESULTS).contains(results))
+            .ok_or(WorkspaceError::InvalidMaxResults),
+    }
+}
 
 fn optional_timeout(arguments: &Value) -> Result<u64, WorkspaceError> {
     match arguments.get("timeoutMs") {
@@ -445,7 +638,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{execute_tool, handle_request};
+    use super::{WorkspaceError, execute_tool, handle_request, tools};
 
     fn request(operation: RequestOperation) -> RequestEnvelope {
         RequestEnvelope {
@@ -585,5 +778,80 @@ mod tests {
         );
         fs::remove_dir_all(root).expect("temporary workspace must be removed");
         fs::remove_file(outside).expect("outside fixture must be removed");
+    }
+
+    #[test]
+    fn declares_grep_as_a_read_only_search_tool() {
+        let grep = tools()
+            .into_iter()
+            .find(|tool| tool.name == "grep")
+            .expect("grep tool must be declared");
+        assert_eq!(grep.input_schema["required"], json!(["pattern"]));
+        assert_eq!(
+            grep.input_schema["properties"]["caseSensitive"]["default"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_searches_text_files_and_respects_ignore_rules() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be after the Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("mycode-plugin-grep-{nonce}"));
+        fs::create_dir_all(root.join("src")).expect("temporary workspace must be created");
+        fs::write(root.join(".gitignore"), "ignored.txt\n").expect("ignore fixture must write");
+        fs::write(root.join("src/note.txt"), "Alpha\nbeta\nALPHA\n")
+            .expect("search fixture must write");
+        fs::write(root.join("ignored.txt"), "alpha\n").expect("ignored fixture must write");
+        let workspace = root.canonicalize().expect("workspace must canonicalize");
+
+        let result = execute_tool(
+            &workspace,
+            CallToolParams {
+                name: "grep".to_owned(),
+                arguments: json!({
+                    "pattern": "^alpha$",
+                    "caseSensitive": false,
+                    "maxResults": 10
+                }),
+            },
+        )
+        .await
+        .expect("grep search must succeed");
+        assert_eq!(result.output, "src/note.txt:1:Alpha\nsrc/note.txt:3:ALPHA");
+        assert!(!result.truncated);
+
+        let limited = execute_tool(
+            &workspace,
+            CallToolParams {
+                name: "grep".to_owned(),
+                arguments: json!({
+                    "pattern": "^alpha$",
+                    "caseSensitive": false,
+                    "maxResults": 1
+                }),
+            },
+        )
+        .await
+        .expect("limited grep search must succeed");
+        assert_eq!(limited.output, "src/note.txt:1:Alpha");
+        assert!(limited.truncated);
+        fs::remove_dir_all(root).expect("temporary workspace must be removed");
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_invalid_regular_expressions() {
+        let workspace = env::current_dir().expect("current directory must exist");
+        let result = execute_tool(
+            &workspace,
+            CallToolParams {
+                name: "grep".to_owned(),
+                arguments: json!({"pattern": "["}),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(WorkspaceError::InvalidGrepPattern(_))));
     }
 }

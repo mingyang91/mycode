@@ -7,7 +7,7 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - `mycode/` owns the authoritative agent state machine, tool ordering, approval decisions, session snapshots, and restart recovery.
 - `crates/mycode-tui/` owns terminal input/rendering, direct OpenAI and Anthropic adapters, the OMP-backed Linewise OpenAI gateway adapter, and asynchronous realization of Lean effects.
 - `crates/mycode-plugin-protocol/` owns the versioned external-plugin wire contract: four-byte big-endian length followed by bounded UTF-8 JSON.
-- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` is automatically safe; `write`, `edit`, and `bash` require a Lean approval effect.
+- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` and `grep` are automatically safe; `write`, `edit`, and `bash` require a Lean approval effect.
 - Rust must never execute a model-proposed tool merely because it parsed a provider response. It may invoke a plugin only after the Lean core emits `invoke_tool`.
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.

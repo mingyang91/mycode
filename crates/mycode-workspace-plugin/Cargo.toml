@@ -14,6 +14,8 @@ unwrap_used = "deny"
 
 [dependencies]
 mycode-plugin-protocol = { path = "../mycode-plugin-protocol" }
+ignore.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 serde.workspace = true

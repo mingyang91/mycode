@@ -1505,6 +1505,14 @@ fn install_terminal_panic_hook() {
     }));
 }
 
+fn automatically_safe_tool_names(tools: &[ToolSpec]) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| matches!(tool.name.as_str(), "read" | "grep"))
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     install_terminal_panic_hook();
@@ -1521,12 +1529,7 @@ async fn main() -> Result<(), AppError> {
         .unwrap_or_else(default_git_plugin_path);
     let mut core = CoreClient::spawn(&core_path, session.as_deref()).await?;
     let plugins = PluginManager::spawn(&args.plugin, &git_plugin_path).await?;
-    let mut safe_tools: Vec<String> = plugins
-        .model_tools()
-        .iter()
-        .filter(|tool| tool.name == "read")
-        .map(|tool| tool.name.clone())
-        .collect();
+    let mut safe_tools = automatically_safe_tool_names(plugins.model_tools());
     if plugins.has_tool("git_read") {
         safe_tools.push("git_read".to_owned());
     }
@@ -2124,9 +2127,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
-        App, COLOR_ACCENT, COLOR_MUTED, CoreMessage, CoreSnapshot, CoreToolCall,
-        TranscriptLayoutCache, anthropic_messages, build_transcript_lines, draw, handle_key,
-        parse_openai_tool_calls,
+        App, COLOR_ACCENT, COLOR_MUTED, CoreMessage, CoreSnapshot, CoreToolCall, ToolSpec,
+        TranscriptLayoutCache, anthropic_messages, automatically_safe_tool_names,
+        build_transcript_lines, draw, handle_key, parse_openai_tool_calls,
     };
 
     #[test]
@@ -2139,6 +2142,23 @@ mod tests {
             .expect("function call must parse");
         assert_eq!(parsed[0].name, "read");
         assert_eq!(parsed[0].arguments["path"], "Main.lean");
+    }
+
+    #[test]
+    fn marks_read_and_grep_as_automatically_safe() {
+        let tools = ["read", "grep", "write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            automatically_safe_tool_names(&tools),
+            vec!["read".to_owned(), "grep".to_owned()]
+        );
     }
 
     #[test]
