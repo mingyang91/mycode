@@ -67,6 +67,11 @@ const COLOR_TOOL: Color = Color::Rgb(250, 204, 21);
 const COLOR_TEXT: Color = Color::Rgb(228, 228, 231);
 const COLOR_MUTED: Color = Color::Rgb(113, 113, 122);
 const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
+const COLOR_USER_BACKGROUND: Color = Color::Rgb(13, 35, 47);
+const COLOR_ASSISTANT_BACKGROUND: Color = Color::Rgb(15, 36, 26);
+const COLOR_TOOL_BACKGROUND: Color = Color::Rgb(42, 36, 13);
+const COLOR_ERROR_BACKGROUND: Color = Color::Rgb(49, 20, 24);
+const COLOR_MESSAGE_BACKGROUND: Color = Color::Rgb(30, 30, 34);
 const COLLAPSED_LIVE_TAIL_LINES: usize = 4;
 const COLLAPSED_COMMAND_LINES: usize = 2;
 const COLLAPSED_FILE_OUTPUT_LINES: usize = 8;
@@ -1498,6 +1503,98 @@ fn indented_wrapped_lines(text: &str, style: Style, width: u16) -> Vec<Line<'sta
     lines
 }
 
+fn transcript_block_content_width(width: u16) -> u16 {
+    if width >= 5 {
+        width - 4
+    } else if width > 2 {
+        width - 2
+    } else {
+        width
+    }
+}
+
+fn style_transcript_block(
+    block: Vec<Line<'static>>,
+    background: Color,
+    border_color: Color,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if width < 5 {
+        let horizontal_padding = usize::from(width > 2);
+        let width = usize::from(width);
+        return block
+            .into_iter()
+            .map(|mut line| {
+                let content_width = line.width();
+                if horizontal_padding != 0 {
+                    line.spans.insert(0, Span::raw(" "));
+                }
+                let occupied = content_width.saturating_add(horizontal_padding);
+                if occupied < width {
+                    line.spans.push(Span::raw(" ".repeat(width - occupied)));
+                }
+                line.style(Style::default().bg(background))
+            })
+            .collect();
+    }
+
+    let width = usize::from(width);
+    let inner_width = width - 2;
+    let horizontal_padding = 1_usize;
+    let block_style = Style::default().bg(background);
+    let border_style = Style::default().fg(border_color).bg(background);
+    let horizontal = "─".repeat(inner_width);
+    let mut styled = Vec::with_capacity(block.len().saturating_add(2));
+    styled.push(
+        Line::from(vec![
+            Span::styled("╭", border_style),
+            Span::styled(horizontal.clone(), border_style),
+            Span::styled("╮", border_style),
+        ])
+        .style(block_style),
+    );
+    for mut line in block {
+        let content_width = line.width();
+        line.spans.insert(0, Span::raw(" "));
+        line.spans.insert(0, Span::styled("│", border_style));
+        let occupied = content_width.saturating_add(horizontal_padding);
+        if occupied < inner_width {
+            line.spans
+                .push(Span::raw(" ".repeat(inner_width - occupied)));
+        }
+        line.spans.push(Span::styled("│", border_style));
+        styled.push(line.style(block_style));
+    }
+    styled.push(
+        Line::from(vec![
+            Span::styled("╰", border_style),
+            Span::styled(horizontal, border_style),
+            Span::styled("╯", border_style),
+        ])
+        .style(block_style),
+    );
+    styled
+}
+
+fn push_transcript_block(
+    lines: &mut Vec<Line<'static>>,
+    block: Vec<Line<'static>>,
+    background: Color,
+    border_color: Color,
+    width: u16,
+) {
+    if block.is_empty() {
+        return;
+    }
+    lines.extend(style_transcript_block(
+        block,
+        background,
+        border_color,
+        width,
+    ));
+    lines.push(Line::default());
+}
+
 struct LiveToolOutput {
     call_id: String,
     label: String,
@@ -1535,7 +1632,8 @@ fn tail_text(bytes: &[u8], lines: usize) -> String {
 }
 
 fn build_live_tool_lines(live: &LiveToolOutput, width: u16, expanded: bool) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
+    let content_width = transcript_block_content_width(width);
+    let mut block = vec![Line::from(Span::styled(
         format!("└ Running · {}  #{}", live.label, live.call_id),
         Style::default().fg(COLOR_TOOL).add_modifier(Modifier::BOLD),
     ))];
@@ -1551,17 +1649,17 @@ fn build_live_tool_lines(live: &LiveToolOutput, width: u16, expanded: bool) -> V
         } else {
             tail_text(bytes, COLLAPSED_LIVE_TAIL_LINES)
         };
-        lines.push(Line::from(Span::styled(
+        block.push(Line::from(Span::styled(
             format!("  {label}{}", if expanded { "" } else { " tail" }),
             Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
         )));
-        lines.extend(indented_wrapped_lines(
+        block.extend(indented_wrapped_lines(
             &content,
             Style::default().fg(color),
-            width,
+            content_width,
         ));
     }
-    lines
+    style_transcript_block(block, COLOR_TOOL_BACKGROUND, COLOR_TOOL, width)
 }
 
 fn build_completed_bash_tail(content: &str, width: u16) -> Vec<Line<'static>> {
@@ -1688,6 +1786,7 @@ fn build_transcript_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut tool_calls: BTreeMap<&str, &CoreToolCall> = BTreeMap::new();
+    let content_width = transcript_block_content_width(width);
     for message in messages {
         let source_call = message
             .tool_call_id
@@ -1695,34 +1794,60 @@ fn build_transcript_lines(
             .and_then(|call_id| tool_calls.get(call_id));
         let is_file_result =
             message.role == "tool" && source_call.is_some_and(|call| call.name == "read");
-        let (label, color, content_color) = match message.role.as_str() {
-            "user" => ("› You", COLOR_USER, COLOR_TEXT),
-            "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
-            "tool" if message.is_error => ("! Tool error", COLOR_ERROR, COLOR_ERROR),
-            "tool" if is_file_result => ("└ File result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
-            "tool" => ("└ Tool result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
-            _ => ("· Message", COLOR_MUTED, COLOR_TEXT),
+        let (label, color, content_color, background) = match message.role.as_str() {
+            "user" => ("› You", COLOR_USER, COLOR_TEXT, COLOR_USER_BACKGROUND),
+            "assistant" => (
+                "• Assistant",
+                COLOR_ASSISTANT,
+                COLOR_TEXT,
+                COLOR_ASSISTANT_BACKGROUND,
+            ),
+            "tool" if message.is_error => (
+                "! Tool error",
+                COLOR_ERROR,
+                COLOR_ERROR,
+                COLOR_ERROR_BACKGROUND,
+            ),
+            "tool" if is_file_result => (
+                "└ File result",
+                COLOR_TOOL,
+                Color::Rgb(161, 161, 170),
+                COLOR_TOOL_BACKGROUND,
+            ),
+            "tool" => (
+                "└ Tool result",
+                COLOR_TOOL,
+                Color::Rgb(161, 161, 170),
+                COLOR_TOOL_BACKGROUND,
+            ),
+            _ => (
+                "· Message",
+                COLOR_MUTED,
+                COLOR_TEXT,
+                COLOR_MESSAGE_BACKGROUND,
+            ),
         };
+        let mut block = Vec::new();
         push_wrapped_line(
-            &mut lines,
+            &mut block,
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
-            width,
+            content_width,
         );
         if !message.content.is_empty() {
             let is_bash_result =
                 message.role == "tool" && source_call.is_some_and(|call| call.name == "bash");
             if is_bash_result && !details_expanded {
-                lines.extend(build_completed_bash_tail(&message.content, width));
+                block.extend(build_completed_bash_tail(&message.content, content_width));
             } else {
                 let content_lines = indented_wrapped_lines(
                     &message.content,
                     Style::default().fg(content_color),
-                    width,
+                    content_width,
                 );
                 if message.role == "tool" {
                     push_folded_lines(
-                        &mut lines,
+                        &mut block,
                         content_lines,
                         details_expanded,
                         COLLAPSED_FILE_OUTPUT_LINES,
@@ -1734,36 +1859,43 @@ fn build_transcript_lines(
                         !is_file_result,
                     );
                 } else {
-                    lines.extend(content_lines);
+                    block.extend(content_lines);
                 }
             }
         }
         for call in &message.tool_calls {
-            push_tool_call(&mut lines, call, width, details_expanded);
+            push_tool_call(&mut block, call, content_width, details_expanded);
             tool_calls.insert(call.call_id.as_str(), call);
         }
-        lines.push(Line::default());
+        push_transcript_block(&mut lines, block, background, color, width);
     }
     for entry in local_entries {
+        let mut block = Vec::new();
         push_wrapped_line(
-            &mut lines,
+            &mut block,
             "◇ BTW sidechain",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
-            width,
+            content_width,
         );
-        lines.extend(indented_wrapped_lines(
+        block.extend(indented_wrapped_lines(
             &format!("Q: {}", entry.question),
             Style::default().fg(COLOR_USER),
-            width,
+            content_width,
         ));
-        lines.extend(indented_wrapped_lines(
+        block.extend(indented_wrapped_lines(
             &entry.answer,
             Style::default().fg(COLOR_TEXT),
-            width,
+            content_width,
         ));
-        lines.push(Line::default());
+        push_transcript_block(
+            &mut lines,
+            block,
+            COLOR_MESSAGE_BACKGROUND,
+            COLOR_ACCENT,
+            width,
+        );
     }
     lines
 }
@@ -2829,12 +2961,14 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
-        App, BtwSidechainStore, COLOR_ACCENT, COLOR_MUTED, CoreEvent, CoreMessage,
-        CoreSnapshot, CoreToolCall, KeyAction, LiveToolOutput, LocalTranscriptEntry,
-        PermissionMode, SlashCommand, SlashCommandError, ToolOutputStream, ToolSpec,
-        TranscriptLayoutCache, UserSubmission, anthropic_messages, automatically_safe_tool_names,
-        btw_sidechain_path, build_live_tool_lines, build_transcript_lines, draw, handle_key,
-        parse_openai_tool_calls, parse_submission,
+        App, BtwSidechainStore, COLOR_ACCENT, COLOR_ASSISTANT, COLOR_ASSISTANT_BACKGROUND,
+        COLOR_ERROR, COLOR_ERROR_BACKGROUND, COLOR_MUTED, COLOR_TOOL, COLOR_TOOL_BACKGROUND,
+        COLOR_USER, COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall,
+        KeyAction, LiveToolOutput, LocalTranscriptEntry, PermissionMode, SlashCommand,
+        SlashCommandError, ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission,
+        anthropic_messages, automatically_safe_tool_names, btw_sidechain_path,
+        build_live_tool_lines, build_transcript_lines, draw, handle_key, parse_openai_tool_calls,
+        parse_submission,
     };
 
     #[test]
@@ -3050,15 +3184,85 @@ mod tests {
             80,
             true,
         );
-        assert_eq!(lines[1].to_string(), "  first");
-        assert_eq!(lines[2].to_string(), "  second");
+        let first_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("first"))
+            .expect("first content line must be present")
+            .to_string();
+        let second_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("second"))
+            .expect("second content line must be present")
+            .to_string();
+        assert!(first_line.starts_with("│   first"));
+        assert!(first_line.ends_with('│'));
+        assert!(second_line.starts_with("│   second"));
+        assert!(second_line.ends_with('│'));
         let tool_line = lines
             .iter()
             .find(|line| line.to_string().contains("git status --short"))
             .expect("tool line must be present");
-        assert_eq!(tool_line.spans[0].style.fg, Some(COLOR_MUTED));
-        assert_eq!(tool_line.spans[1].style.fg, Some(COLOR_ACCENT));
         assert_eq!(tool_line.spans[2].style.fg, Some(COLOR_MUTED));
+        assert_eq!(tool_line.spans[3].style.fg, Some(COLOR_ACCENT));
+        assert_eq!(tool_line.spans[4].style.fg, Some(COLOR_MUTED));
+    }
+
+    #[test]
+    fn message_blocks_have_rounded_role_borders_and_backgrounds() {
+        let lines = build_transcript_lines(
+            &[
+                CoreMessage {
+                    role: "user".to_owned(),
+                    content: "request".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "answer".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "tool".to_owned(),
+                    content: "result".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "tool".to_owned(),
+                    content: "failed".to_owned(),
+                    is_error: true,
+                    ..CoreMessage::default()
+                },
+            ],
+            &[],
+            32,
+            true,
+        );
+        let blocks = lines
+            .split(|line| line.spans.is_empty())
+            .filter(|block| !block.is_empty())
+            .collect::<Vec<_>>();
+        let styles = [
+            (COLOR_USER_BACKGROUND, COLOR_USER),
+            (COLOR_ASSISTANT_BACKGROUND, COLOR_ASSISTANT),
+            (COLOR_TOOL_BACKGROUND, COLOR_TOOL),
+            (COLOR_ERROR_BACKGROUND, COLOR_ERROR),
+        ];
+
+        assert_eq!(blocks.len(), styles.len());
+        for (block, (background, border)) in blocks.into_iter().zip(styles) {
+            let top = block.first().expect("block must have a top border");
+            let bottom = block.last().expect("block must have a bottom border");
+            assert!(top.to_string().starts_with('╭'));
+            assert!(top.to_string().ends_with('╮'));
+            assert!(bottom.to_string().starts_with('╰'));
+            assert!(bottom.to_string().ends_with('╯'));
+            assert_eq!(top.spans[0].style.fg, Some(border));
+            assert_eq!(bottom.spans[0].style.fg, Some(border));
+            for line in block {
+                assert_eq!(line.width(), 32);
+                assert_eq!(line.style.bg, Some(background));
+            }
+        }
     }
 
     #[test]
@@ -3263,7 +3467,7 @@ mod tests {
             ..CoreSnapshot::default()
         };
         let mut app = App::new(snapshot);
-        let backend = TestBackend::new(100, 18);
+        let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
         terminal
             .draw(|frame| draw(frame, &mut app))
@@ -3370,7 +3574,7 @@ mod tests {
             .draw(|frame| draw(frame, &mut app))
             .expect("padded transcript must draw");
 
-        let rendered_lines = 7_usize;
+        let rendered_lines = 11_usize;
         assert_eq!(app.max_scroll, rendered_lines.saturating_sub(app.page_rows));
         assert_eq!(app.scroll_offset, app.max_scroll);
         assert!(app.follow_tail);

@@ -721,11 +721,6 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use mycode_plugin_protocol::{
-        CallToolParams, InitializeParams, RequestEnvelope, RequestOperation,
-    };
-    use serde_json::json;
-
     use super::{WorkspaceError, execute_tool, handle_request, tools};
 
     fn request(operation: RequestOperation) -> RequestEnvelope {
@@ -948,7 +943,7 @@ mod tests {
         fs::write(root.join("ignored.txt"), "alpha\n").expect("ignored fixture must write");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
 
-        let result = execute_tool(
+        let result = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "grep".to_owned(),
@@ -964,7 +959,7 @@ mod tests {
         assert_eq!(result.output, "src/note.txt:1:Alpha\nsrc/note.txt:3:ALPHA");
         assert!(!result.truncated);
 
-        let limited = execute_tool(
+        let limited = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "grep".to_owned(),
@@ -985,7 +980,7 @@ mod tests {
     #[tokio::test]
     async fn grep_rejects_invalid_regular_expressions() {
         let workspace = env::current_dir().expect("current directory must exist");
-        let result = execute_tool(
+        let result = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "grep".to_owned(),
