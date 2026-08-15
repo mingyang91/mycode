@@ -1,5 +1,5 @@
 [package]
-name = "agent-workspace-plugin"
+name = "mycode-plugin-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,7 @@ unsafe_op_in_unsafe_fn = "deny"
 unwrap_used = "deny"
 
 [dependencies]
-agent-plugin-protocol = { path = "../agent-plugin-protocol" }
-serde_json.workspace = true
-uuid.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

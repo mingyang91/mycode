@@ -9,11 +9,6 @@ use std::{
     time::Duration,
 };
 
-use agent_plugin_protocol::{
-    CallToolParams, DEFAULT_MAX_FRAME_BYTES, InitializeParams, InitializeResult, Limits,
-    RequestEnvelope as PluginRequest, RequestOperation as PluginOperation, ToolListResult,
-    ToolResult, ToolSpec, read_response, write_request,
-};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::Show;
 use crossterm::{
@@ -25,6 +20,11 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
+use mycode_plugin_protocol::{
+    CallToolParams, DEFAULT_MAX_FRAME_BYTES, InitializeParams, InitializeResult, Limits,
+    RequestEnvelope as PluginRequest, RequestOperation as PluginOperation, ToolListResult,
+    ToolResult, ToolSpec, read_response, write_request,
+};
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -76,7 +76,7 @@ enum Provider {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "agent-tui",
+    name = "mycode-tui",
     about = "Lean 4 native coding agent with a Rust Ratatui shell"
 )]
 struct Args {
@@ -429,7 +429,7 @@ enum PluginClientError {
     #[error("plugin did not provide piped standard I/O")]
     MissingPipe,
     #[error("plugin protocol failed: {0}")]
-    Protocol(#[from] agent_plugin_protocol::ProtocolError),
+    Protocol(#[from] mycode_plugin_protocol::ProtocolError),
     #[error("plugin reply id did not match the request")]
     CorrelationMismatch,
     #[error("plugin did not support protocol version one")]
@@ -477,8 +477,8 @@ impl PluginClient {
                 v: 1,
                 id: init_id.clone(),
                 operation: PluginOperation::Initialize(InitializeParams {
-                    host: agent_plugin_protocol::HostIdentity {
-                        name: "lean-coding-agent".to_owned(),
+                    host: mycode_plugin_protocol::HostIdentity {
+                        name: "mycode".to_owned(),
                         version: env!("CARGO_PKG_VERSION").to_owned(),
                     },
                     limits: Limits::default(),
@@ -500,7 +500,7 @@ impl PluginClient {
             &PluginRequest {
                 v: 1,
                 id: list_id.clone(),
-                operation: PluginOperation::ListTools(agent_plugin_protocol::EmptyParams {}),
+                operation: PluginOperation::ListTools(mycode_plugin_protocol::EmptyParams {}),
             },
         )
         .await?;
@@ -590,7 +590,7 @@ impl PluginClient {
         let request = PluginRequest {
             v: 1,
             id: "shutdown_1".to_owned(),
-            operation: PluginOperation::Shutdown(agent_plugin_protocol::EmptyParams {}),
+            operation: PluginOperation::Shutdown(mycode_plugin_protocol::EmptyParams {}),
         };
         let clean_shutdown = match write_request(&mut self.input, &request).await {
             Ok(()) => match timeout(
@@ -1179,12 +1179,7 @@ fn push_folded_lines(
     }
 }
 
-fn push_tool_call(
-    lines: &mut Vec<Line<'static>>,
-    call: &CoreToolCall,
-    width: u16,
-    expanded: bool,
-) {
+fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u16, expanded: bool) {
     if width == 0 {
         return;
     }
@@ -1233,7 +1228,11 @@ fn push_tool_call(
         )));
     } else if expanded && !suffix.is_empty() && !wrapped.is_empty() {
         let last = wrapped.last().expect("non-empty tool command summary");
-        let last_indent = if wrapped.len() == 1 { prefix } else { continuation };
+        let last_indent = if wrapped.len() == 1 {
+            prefix
+        } else {
+            continuation
+        };
         if textwrap::core::display_width(last_indent)
             + textwrap::core::display_width(last)
             + textwrap::core::display_width(&suffix)
@@ -1259,7 +1258,8 @@ fn build_transcript_lines(
             .tool_call_id
             .as_deref()
             .and_then(|call_id| tool_calls.get(call_id));
-        let is_file_result = message.role == "tool" && source_call.is_some_and(|call| call.name == "read");
+        let is_file_result =
+            message.role == "tool" && source_call.is_some_and(|call| call.name == "read");
         let (label, color, content_color) = match message.role.as_str() {
             "user" => ("› You", COLOR_USER, COLOR_TEXT),
             "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
@@ -1275,18 +1275,19 @@ fn build_transcript_lines(
             width,
         );
         if !message.content.is_empty() {
-            let content_lines = indented_wrapped_lines(
-                &message.content,
-                Style::default().fg(content_color),
-                width,
-            );
+            let content_lines =
+                indented_wrapped_lines(&message.content, Style::default().fg(content_color), width);
             if message.role == "tool" {
                 push_folded_lines(
                     &mut lines,
                     content_lines,
                     details_expanded,
                     COLLAPSED_FILE_OUTPUT_LINES,
-                    if is_file_result { "file output" } else { "tool output" },
+                    if is_file_result {
+                        "file output"
+                    } else {
+                        "tool output"
+                    },
                 );
             } else {
                 lines.extend(content_lines);
@@ -1764,6 +1765,10 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return KeyAction::Quit;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('e')) {
+        app.toggle_transcript_details();
+        return KeyAction::None;
+    }
     match key.code {
         KeyCode::Up => {
             app.scroll_up(1);
@@ -2005,7 +2010,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " lean-coding-agent ",
+                " mycode ",
                 Style::default()
                     .fg(COLOR_TEXT)
                     .bg(COLOR_ACCENT)
@@ -2072,6 +2077,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         format!(" · view {}/{}", app.scroll_offset, app.max_scroll)
     };
+    let details = if app.transcript_details_expanded {
+        " · Ctrl+E collapse details"
+    } else {
+        " · Ctrl+E expand details"
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -2082,7 +2092,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · pending {} · safe {}{scroll}",
+                    " · pending {} · safe {}{scroll}{details}",
                     app.snapshot.pending_calls.len(),
                     app.snapshot.safe_tools.len()
                 ),
@@ -2095,29 +2105,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 fn default_core_path() -> PathBuf {
-    if let Some(path) = env::var_os("LEAN_AGENT_CORE_BIN") {
+    if let Some(path) = env::var_os("MYCODE_CORE_BIN") {
         return PathBuf::from(path);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lean_agent_core/.lake/build/bin/lean_agent_core")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mycode/.lake/build/bin/mycode")
 }
 
 fn default_git_plugin_path() -> PathBuf {
-    if let Some(path) = env::var_os("LEAN_AGENT_GIT_PLUGIN_BIN") {
+    if let Some(path) = env::var_os("MYCODE_GIT_PLUGIN_BIN") {
         return PathBuf::from(path);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lean_agent_core/.lake/build/bin/lean_agent_git_plugin")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mycode/.lake/build/bin/mycode_git_plugin")
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
         App, COLOR_ACCENT, COLOR_MUTED, CoreMessage, CoreSnapshot, CoreToolCall,
-        TranscriptLayoutCache, anthropic_messages, build_transcript_lines, draw,
+        TranscriptLayoutCache, anthropic_messages, build_transcript_lines, draw, handle_key,
         parse_openai_tool_calls,
     };
 
@@ -2180,6 +2188,7 @@ mod tests {
                 },
             ],
             80,
+            true,
         );
         assert_eq!(lines[1].to_string(), "  first");
         assert_eq!(lines[2].to_string(), "  second");
@@ -2190,6 +2199,90 @@ mod tests {
         assert_eq!(tool_line.spans[0].style.fg, Some(COLOR_MUTED));
         assert_eq!(tool_line.spans[1].style.fg, Some(COLOR_ACCENT));
         assert_eq!(tool_line.spans[2].style.fg, Some(COLOR_MUTED));
+    }
+
+    #[test]
+    fn folds_long_commands_until_details_are_expanded() {
+        let messages = [CoreMessage {
+            role: "assistant".to_owned(),
+            tool_calls: vec![CoreToolCall {
+                call_id: "call_long".to_owned(),
+                name: "bash".to_owned(),
+                arguments: serde_json::json!({"command": "x".repeat(160)}),
+            }],
+            ..CoreMessage::default()
+        }];
+        let collapsed = build_transcript_lines(&messages, 32, false);
+        let expanded = build_transcript_lines(&messages, 32, true);
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.to_string().contains("command lines hidden"))
+        );
+        assert!(
+            !expanded
+                .iter()
+                .any(|line| line.to_string().contains("command lines hidden"))
+        );
+        assert!(expanded.len() > collapsed.len());
+    }
+
+    #[test]
+    fn folds_long_file_results_until_details_are_expanded() {
+        let messages = [
+            CoreMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![CoreToolCall {
+                    call_id: "call_read".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({"path": "large.txt"}),
+                }],
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("call_read".to_owned()),
+                content: (0..16)
+                    .map(|index| format!("line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                ..CoreMessage::default()
+            },
+        ];
+        let collapsed = build_transcript_lines(&messages, 80, false);
+        let expanded = build_transcript_lines(&messages, 80, true);
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.to_string().contains("└ File result"))
+        );
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.to_string().contains("file output lines hidden"))
+        );
+        assert!(
+            !expanded
+                .iter()
+                .any(|line| line.to_string().contains("file output lines hidden"))
+        );
+        assert!(expanded.len() > collapsed.len());
+    }
+
+    #[test]
+    fn control_e_toggles_transcript_details_and_invalidates_layout() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.transcript_layout = Some(TranscriptLayoutCache {
+            revision: app.transcript_revision,
+            width: 80,
+            lines: vec![Line::default()],
+        });
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert!(app.transcript_details_expanded);
+        assert!(app.transcript_layout.is_none());
     }
 
     #[test]
@@ -2249,7 +2342,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         for expected in [
-            "lean-coding-agent",
+            "mycode",
             "› You",
             "• Assistant",
             "└─ bash  git status --short",

@@ -1,6 +1,6 @@
 /target/
 /.lake/
-lean_agent_core/.lake/
-lean_agent_core/lake-manifest.json
+mycode/.lake/
+mycode/lake-manifest.json
 *.swp
 .DS_Store

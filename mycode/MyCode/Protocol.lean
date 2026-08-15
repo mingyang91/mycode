@@ -2,7 +2,7 @@ import Lean.Data.Json
 
 open Lean
 
-namespace LeanAgentCore
+namespace MyCode
 
 public def protocolVersion : Nat := 1
 
@@ -101,4 +101,4 @@ public def Effect.invokeTool (call : ToolCall) : Effect := {
   call? := some call
 }
 
-end LeanAgentCore
+end MyCode

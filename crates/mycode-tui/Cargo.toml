@@ -1,5 +1,5 @@
 [package]
-name = "agent-plugin-protocol"
+name = "mycode-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,17 @@ unsafe_op_in_unsafe_fn = "deny"
 unwrap_used = "deny"
 
 [dependencies]
+mycode-plugin-protocol = { path = "../mycode-plugin-protocol" }
+clap.workspace = true
+crossterm.workspace = true
+nix.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+textwrap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true

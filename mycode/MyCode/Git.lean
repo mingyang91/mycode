@@ -1,8 +1,8 @@
-import LeanAgentCore.Protocol
+import MyCode.Protocol
 
 open Lean
 
-namespace LeanAgentCore
+namespace MyCode
 
 public inductive GitCapability where
   | inspect
@@ -222,4 +222,4 @@ public theorem git_handler_preserves_valid (observed : GitObservation)
   rw [refines intent before result after execution]
   exact intent.step_preserves_valid before valid
 
-end LeanAgentCore
+end MyCode

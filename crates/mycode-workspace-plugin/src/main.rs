@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use agent_plugin_protocol::{
+use mycode_plugin_protocol::{
     CallToolParams, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_TOOL_OUTPUT_BYTES, EmptyParams,
     InitializeResult, PluginErrorCode, PluginIdentity, ProtocolRange, RequestEnvelope,
     RequestOperation, ResponseEnvelope, ToolListResult, ToolResult, ToolSpec, read_request,
@@ -262,7 +262,7 @@ async fn edit_file(workspace: &Path, arguments: &Value) -> Result<String, Worksp
 
 async fn atomic_replace(path: &Path, content: &[u8]) -> Result<(), WorkspaceError> {
     let parent = path.parent().ok_or(WorkspaceError::MissingParent)?;
-    let temporary = parent.join(format!(".lean-agent-write-{}.tmp", Uuid::new_v4()));
+    let temporary = parent.join(format!(".mycode-write-{}.tmp", Uuid::new_v4()));
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -440,7 +440,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agent_plugin_protocol::{
+    use mycode_plugin_protocol::{
         CallToolParams, InitializeParams, RequestEnvelope, RequestOperation,
     };
     use serde_json::json;
@@ -460,7 +460,7 @@ mod tests {
         let workspace = env::current_dir().expect("current directory must exist");
         let (response, shutdown) = handle_request(
             request(RequestOperation::ListTools(
-                agent_plugin_protocol::EmptyParams {},
+                mycode_plugin_protocol::EmptyParams {},
             )),
             &workspace,
             false,
@@ -471,11 +471,11 @@ mod tests {
 
         let (initialized, _) = handle_request(
             request(RequestOperation::Initialize(InitializeParams {
-                host: agent_plugin_protocol::HostIdentity {
+                host: mycode_plugin_protocol::HostIdentity {
                     name: "test-host".to_owned(),
                     version: "1".to_owned(),
                 },
-                limits: agent_plugin_protocol::Limits::default(),
+                limits: mycode_plugin_protocol::Limits::default(),
             })),
             &workspace,
             false,
@@ -490,7 +490,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock must be after the Unix epoch")
             .as_nanos();
-        let root = env::temp_dir().join(format!("lean-agent-plugin-{nonce}"));
+        let root = env::temp_dir().join(format!("mycode-plugin-{nonce}"));
         fs::create_dir(&root).expect("temporary workspace must be created");
         fs::write(root.join("note.txt"), "safe content").expect("fixture must write");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
@@ -522,11 +522,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock must be after the Unix epoch")
             .as_nanos();
-        let root = env::temp_dir().join(format!("lean-agent-plugin-limit-{nonce}"));
+        let root = env::temp_dir().join(format!("mycode-plugin-limit-{nonce}"));
         fs::create_dir(&root).expect("temporary workspace must be created");
         fs::write(
             root.join("large.txt"),
-            vec![b'x'; agent_plugin_protocol::DEFAULT_MAX_TOOL_OUTPUT_BYTES + 1],
+            vec![b'x'; mycode_plugin_protocol::DEFAULT_MAX_TOOL_OUTPUT_BYTES + 1],
         )
         .expect("fixture must write");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
@@ -554,8 +554,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock must be after the Unix epoch")
             .as_nanos();
-        let root = env::temp_dir().join(format!("lean-agent-plugin-symlink-{nonce}"));
-        let outside = env::temp_dir().join(format!("lean-agent-outside-{nonce}"));
+        let root = env::temp_dir().join(format!("mycode-plugin-symlink-{nonce}"));
+        let outside = env::temp_dir().join(format!("mycode-outside-{nonce}"));
         fs::create_dir(&root).expect("temporary workspace must be created");
         fs::write(&outside, "outside").expect("outside fixture must write");
         symlink(&outside, root.join("link.txt")).expect("symlink fixture must be created");

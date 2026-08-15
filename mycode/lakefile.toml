@@ -1,0 +1,22 @@
+name = "mycode"
+version = "0.1.0"
+defaultTargets = ["mycode"]
+
+[[lean_lib]]
+name = "MyCode"
+
+[[lean_exe]]
+name = "mycode"
+root = "Main"
+
+[[lean_exe]]
+name = "mycode_tests"
+root = "Tests"
+
+[[lean_exe]]
+name = "mycode_git_plugin"
+root = "GitPluginMain"
+
+[[lean_exe]]
+name = "mycode_git_plugin_tests"
+root = "GitPluginTests"

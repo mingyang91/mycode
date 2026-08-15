@@ -1,8 +1,8 @@
 [workspace]
 members = [
-  "crates/agent-plugin-protocol",
-  "crates/agent-workspace-plugin",
-  "crates/agent-tui",
+  "crates/mycode-plugin-protocol",
+  "crates/mycode-workspace-plugin",
+  "crates/mycode-tui",
 ]
 resolver = "3"
 

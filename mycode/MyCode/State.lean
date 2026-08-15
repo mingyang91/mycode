@@ -1,6 +1,6 @@
-import LeanAgentCore.Git
+import MyCode.Git
 
-namespace LeanAgentCore
+namespace MyCode
 
 private def currentTool? (state : State) : Option ToolCall :=
   state.pendingCalls[state.currentCall]?
@@ -114,4 +114,4 @@ public def transition (state : State) (event : Event) : Except String (State × 
   | _ => throw s!"unknown event kind: {event.kind}"
 
 
-end LeanAgentCore
+end MyCode

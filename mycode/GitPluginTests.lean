@@ -1,4 +1,4 @@
-import LeanAgentCore.Git
+import MyCode.Git
 
 open Lean
 
@@ -61,7 +61,7 @@ private def hasTool (tools : Array Json) (name : String) : Bool :=
     | _ => false
 
 private def testGitPluginProtocol : IO Unit := do
-  let plugin ← IO.FS.realPath (System.FilePath.mk ".lake/build/bin/lean_agent_git_plugin")
+  let plugin ← IO.FS.realPath (System.FilePath.mk ".lake/build/bin/mycode_git_plugin")
   let workspace ← IO.FS.realPath (System.FilePath.mk "..")
   let child ← IO.Process.spawn {
     cmd := plugin.toString

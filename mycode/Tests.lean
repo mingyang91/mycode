@@ -1,7 +1,7 @@
-import LeanAgentCore.State
+import MyCode.State
 
 open Lean
-open LeanAgentCore
+open MyCode
 
 private def assert (condition : Bool) (label : String) : IO Unit :=
   unless condition do throw (IO.userError label)
@@ -137,4 +137,4 @@ def main : IO Unit := do
   testCompoundGitFallsBackToBash
   testGitStaysInBashWithoutCapability
   testQuotedCommitMessageParses
-  IO.println "Lean agent core tests passed"
+  IO.println "MyCode core tests passed"

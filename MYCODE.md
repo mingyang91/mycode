@@ -1,13 +1,13 @@
-# CLAUDE.md — lean-coding-agent
+# MYCODE.md — mycode
 
 Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm shell. Node.js and TypeScript are out of scope.
 
 ## Architecture
 
-- `lean_agent_core/` owns the authoritative agent state machine, tool ordering, approval decisions, session snapshots, and restart recovery.
-- `crates/agent-tui/` owns terminal input/rendering, direct OpenAI and Anthropic adapters, the OMP-backed Linewise OpenAI gateway adapter, and asynchronous realization of Lean effects.
-- `crates/agent-plugin-protocol/` owns the versioned external-plugin wire contract: four-byte big-endian length followed by bounded UTF-8 JSON.
-- `crates/agent-workspace-plugin/` is the first-party workspace plugin. `read` is automatically safe; `write`, `edit`, and `bash` require a Lean approval effect.
+- `mycode/` owns the authoritative agent state machine, tool ordering, approval decisions, session snapshots, and restart recovery.
+- `crates/mycode-tui/` owns terminal input/rendering, direct OpenAI and Anthropic adapters, the OMP-backed Linewise OpenAI gateway adapter, and asynchronous realization of Lean effects.
+- `crates/mycode-plugin-protocol/` owns the versioned external-plugin wire contract: four-byte big-endian length followed by bounded UTF-8 JSON.
+- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` is automatically safe; `write`, `edit`, and `bash` require a Lean approval effect.
 - Rust must never execute a model-proposed tool merely because it parsed a provider response. It may invoke a plugin only after the Lean core emits `invoke_tool`.
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.
@@ -15,7 +15,7 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 ## Lean rules
 
 - Keep the transition function deterministic and free of external effects.
-- Add every new state transition to focused tests in `lean_agent_core/Tests.lean`.
+- Add every new state transition to focused tests in `mycode/Tests.lean`.
 - Persist the next state before returning its effects. A persistence failure must not publish the transition.
 - Do not add proof escapes such as `sorry`, `admit`, `axiom`, `opaque`, `unsafe`, or `native_decide`.
 - Keep wire field and constructor names stable. Rust depends on Lean's derived JSON encoding.
@@ -37,9 +37,9 @@ Follow the discipline used by the Linewise native executors:
 Run after Lean changes:
 
 ```bash
-cd lean_agent_core
-lake build lean_agent_core lean_agent_core_tests
-./.lake/build/bin/lean_agent_core_tests
+cd mycode
+lake build mycode mycode_tests
+./.lake/build/bin/mycode_tests
 ```
 
 Run after Rust changes:

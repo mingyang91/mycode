@@ -3,48 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-plugin-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-tui"
-version = "0.1.0"
-dependencies = [
- "agent-plugin-protocol",
- "clap",
- "crossterm",
- "futures-util",
- "nix",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "textwrap",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "agent-workspace-plugin"
-version = "0.1.0"
-dependencies = [
- "agent-plugin-protocol",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1069,6 +1027,48 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mycode-plugin-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "mycode-tui"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "futures-util",
+ "mycode-plugin-protocol",
+ "nix",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "textwrap",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "mycode-workspace-plugin"
+version = "0.1.0"
+dependencies = [
+ "mycode-plugin-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

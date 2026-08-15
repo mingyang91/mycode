@@ -1,9 +1,9 @@
-import LeanAgentCore.Git
+import MyCode.Git
 
 open Lean
-open LeanAgentCore
+open MyCode
 
-namespace LeanAgentGitPlugin
+namespace MyCodeGitPlugin
 
 private def protocolVersion : Nat := 1
 private def maxFrameBytes : Nat := 1_048_576
@@ -318,6 +318,6 @@ def main : IO Unit := do
   let context ← discoverGit (← IO.currentDir)
   serve context false
 
-end LeanAgentGitPlugin
+end MyCodeGitPlugin
 
-def main : IO Unit := LeanAgentGitPlugin.main
+def main : IO Unit := MyCodeGitPlugin.main

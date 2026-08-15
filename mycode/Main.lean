@@ -1,7 +1,7 @@
-import LeanAgentCore.State
+import MyCode.State
 
 open Lean
-open LeanAgentCore
+open MyCode
 
 private def decodeRequest (line : String) : Except String Request := do
   let json ← Json.parse line
@@ -92,5 +92,5 @@ private partial def serve (path? : Option System.FilePath) (initial : State) : I
 def main (args : List String) : IO Unit := do
   let path? := sessionPathFromArgs args
   let state ← loadState path?
-  IO.eprintln "lean-agent-core ready"
+  IO.eprintln "mycode-core ready"
   serve path? state
