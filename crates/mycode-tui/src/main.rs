@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -58,6 +58,7 @@ const CORE_PROTOCOL_VERSION: u64 = 1;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BTW_SIDECHAIN_BYTES: usize = 4 * 1024 * 1024;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const COLOR_ACCENT: Color = Color::Rgb(139, 92, 246);
 const COLOR_USER: Color = Color::Rgb(56, 189, 248);
@@ -113,6 +114,8 @@ struct Args {
     #[arg(long)]
     session: Option<PathBuf>,
     #[arg(long)]
+    btw_sidechain: Option<PathBuf>,
+    #[arg(long)]
     base_url: Option<String>,
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
     system_prompt: String,
@@ -146,6 +149,24 @@ enum AppError {
     UnsupportedSessionPhase { phase: String },
     #[error("plugin progress carried invalid base64: {0}")]
     ToolProgressEncoding(#[from] base64::DecodeError),
+    #[error("failed to access BTW sidechain {path}: {source}")]
+    SidechainIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("BTW sidechain {path} was not valid JSON: {source}")]
+    SidechainJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("BTW sidechain {path} exceeded {limit} bytes")]
+    SidechainTooLarge { path: PathBuf, limit: usize },
+    #[error("BTW sidechain {path} uses unsupported version {version}")]
+    SidechainVersion { path: PathBuf, version: u32 },
+    #[error("could not determine a home directory for BTW sidechain storage")]
+    MissingHomeDirectory,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -931,14 +952,30 @@ impl ModelClient {
     async fn complete_text_only(
         &self,
         snapshot: &CoreSnapshot,
+        sidechain: &[LocalTranscriptEntry],
         question: &str,
     ) -> Result<String, ProviderError> {
         let mut side_snapshot = snapshot.clone();
         side_snapshot.messages.push(CoreMessage {
             role: "user".to_owned(),
-            content: format!(
-                "[One-off BTW side question. Answer directly without continuing or changing the main task.]\n\n{question}"
-            ),
+            content: "[BTW sidechain. Keep this discussion separate from the main task. Answer without using tools or changing the main task.]".to_owned(),
+            ..CoreMessage::default()
+        });
+        for entry in sidechain {
+            side_snapshot.messages.push(CoreMessage {
+                role: "user".to_owned(),
+                content: entry.question.clone(),
+                ..CoreMessage::default()
+            });
+            side_snapshot.messages.push(CoreMessage {
+                role: "assistant".to_owned(),
+                content: entry.answer.clone(),
+                ..CoreMessage::default()
+            });
+        }
+        side_snapshot.messages.push(CoreMessage {
+            role: "user".to_owned(),
+            content: question.to_owned(),
             ..CoreMessage::default()
         });
         let completion = self.complete(&side_snapshot, &[]).await?;
@@ -1256,10 +1293,174 @@ struct TranscriptLayoutCache {
     lines: Vec<Line<'static>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct LocalTranscriptEntry {
     question: String,
     answer: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SidechainFile {
+    version: u32,
+    entries: Vec<LocalTranscriptEntry>,
+}
+
+struct BtwSidechainStore {
+    path: PathBuf,
+    entries: Vec<LocalTranscriptEntry>,
+}
+
+impl BtwSidechainStore {
+    async fn load(path: PathBuf) -> Result<Self, AppError> {
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    entries: Vec::new(),
+                });
+            }
+            Err(source) => {
+                return Err(AppError::SidechainIo { path, source });
+            }
+        };
+        let mut bytes = Vec::with_capacity(8192);
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = file
+                .read(&mut chunk)
+                .await
+                .map_err(|source| AppError::SidechainIo {
+                    path: path.clone(),
+                    source,
+                })?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len() + count > MAX_BTW_SIDECHAIN_BYTES {
+                return Err(AppError::SidechainTooLarge {
+                    path,
+                    limit: MAX_BTW_SIDECHAIN_BYTES,
+                });
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let stored: SidechainFile =
+            serde_json::from_slice(&bytes).map_err(|source| AppError::SidechainJson {
+                path: path.clone(),
+                source,
+            })?;
+        if stored.version != 1 {
+            return Err(AppError::SidechainVersion {
+                path,
+                version: stored.version,
+            });
+        }
+        Ok(Self {
+            path,
+            entries: stored.entries,
+        })
+    }
+
+    async fn append(&mut self, entry: LocalTranscriptEntry) -> Result<(), AppError> {
+        self.entries.push(entry);
+        if let Err(error) = self.save().await {
+            self.entries.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn save(&self) -> Result<(), AppError> {
+        let payload = serde_json::to_vec(&SidechainFile {
+            version: 1,
+            entries: self.entries.clone(),
+        })
+        .map_err(|source| AppError::SidechainJson {
+            path: self.path.clone(),
+            source,
+        })?;
+        if payload.len() > MAX_BTW_SIDECHAIN_BYTES {
+            return Err(AppError::SidechainTooLarge {
+                path: self.path.clone(),
+                limit: MAX_BTW_SIDECHAIN_BYTES,
+            });
+        }
+        let parent = self.path.parent().ok_or_else(|| AppError::SidechainIo {
+            path: self.path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sidechain path has no parent",
+            ),
+        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| AppError::SidechainIo {
+                path: self.path.clone(),
+                source,
+            })?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("btw-sidechain");
+        let temporary = self
+            .path
+            .with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .await?;
+            file.write_all(&payload).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temporary, &self.path).await
+        }
+        .await;
+        if let Err(source) = result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(AppError::SidechainIo {
+                path: self.path.clone(),
+                source,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn btw_sidechain_path(
+    configured: Option<&Path>,
+    session: Option<&Path>,
+) -> Result<PathBuf, AppError> {
+    if let Some(path) = configured {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(session) = session {
+        let mut sidecar = session.as_os_str().to_os_string();
+        sidecar.push(".btw.json");
+        return Ok(PathBuf::from(sidecar));
+    }
+    let home = env::var_os("MYCODE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".mycode")))
+        .ok_or(AppError::MissingHomeDirectory)?;
+    let workspace = env::current_dir()?.canonicalize()?;
+    Ok(home
+        .join("sidechains")
+        .join(format!("{:016x}.json", stable_path_hash(&workspace))))
 }
 
 fn push_wrapped_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: u16) {
@@ -1546,7 +1747,7 @@ fn build_transcript_lines(
     for entry in local_entries {
         push_wrapped_line(
             &mut lines,
-            "◇ BTW · local only",
+            "◇ BTW sidechain",
             Style::default()
                 .fg(COLOR_ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -1626,6 +1827,12 @@ impl App {
 
     fn push_local_entry(&mut self, entry: LocalTranscriptEntry) {
         self.local_entries.push(entry);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_layout = None;
+    }
+
+    fn set_local_entries(&mut self, entries: Vec<LocalTranscriptEntry>) {
+        self.local_entries = entries;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_layout = None;
     }
@@ -1832,6 +2039,7 @@ struct RuntimeResources {
     provider: ModelClient,
     desired_safe_tools: Vec<String>,
     desired_permission_mode: PermissionMode,
+    sidechain: BtwSidechainStore,
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeResources>>;
@@ -1872,6 +2080,9 @@ async fn main() -> Result<(), AppError> {
         let parent = path.parent().ok_or(AppError::SessionPathWithoutParent)?;
         tokio::fs::create_dir_all(parent).await?;
     }
+    let sidechain_path = btw_sidechain_path(args.btw_sidechain.as_deref(), session.as_deref())?;
+    let sidechain = BtwSidechainStore::load(sidechain_path).await?;
+    let sidechain_entries = sidechain.entries.clone();
     let core_path = args.core.clone().unwrap_or_else(default_core_path);
     let git_plugin_path = args
         .git_plugin
@@ -1886,6 +2097,7 @@ async fn main() -> Result<(), AppError> {
     let provider = ModelClient::from_args(&args).await?;
     let initial = core.snapshot().await?;
     let mut app = App::new(initial.snapshot);
+    app.set_local_entries(sidechain_entries);
     let initial_action = match app.snapshot.phase.as_str() {
         "idle" => {
             let configured = core
@@ -1955,6 +2167,7 @@ async fn main() -> Result<(), AppError> {
         provider,
         desired_safe_tools: safe_tools,
         desired_permission_mode: args.permission_mode,
+        sidechain,
     }));
     run_tui(&mut app, Arc::clone(&runtime), initial_action).await?;
     let mut runtime = runtime.lock().await;
@@ -2294,13 +2507,19 @@ async fn run_runtime_action(
                         local_entry: None,
                     });
                 }
-                result = runtime.provider.complete_text_only(&snapshot, &question) => result?,
+                result = runtime.provider.complete_text_only(
+                    &snapshot,
+                    &runtime.sidechain.entries,
+                    &question,
+                ) => result?,
             };
+            let entry = LocalTranscriptEntry { question, answer };
+            runtime.sidechain.append(entry.clone()).await?;
             Ok(RuntimeFinal {
                 snapshot,
                 status: "Ready".to_owned(),
                 approval: None,
-                local_entry: Some(LocalTranscriptEntry { question, answer }),
+                local_entry: Some(entry),
             })
         }
         RuntimeAction::Submit(text) => {
@@ -2600,15 +2819,22 @@ fn default_git_plugin_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env, fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
-        App, COLOR_ACCENT, COLOR_MUTED, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall,
-        KeyAction, LiveToolOutput, LocalTranscriptEntry, PermissionMode, SlashCommand,
-        SlashCommandError, ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission,
-        anthropic_messages, automatically_safe_tool_names, build_live_tool_lines,
-        build_transcript_lines, draw, handle_key, parse_openai_tool_calls, parse_submission,
+        App, BtwSidechainStore, COLOR_ACCENT, COLOR_MUTED, CoreEvent, CoreMessage,
+        CoreSnapshot, CoreToolCall, KeyAction, LiveToolOutput, LocalTranscriptEntry,
+        PermissionMode, SlashCommand, SlashCommandError, ToolOutputStream, ToolSpec,
+        TranscriptLayoutCache, UserSubmission, anthropic_messages, automatically_safe_tool_names,
+        btw_sidechain_path, build_live_tool_lines, build_transcript_lines, draw, handle_key,
+        parse_openai_tool_calls, parse_submission,
     };
 
     #[test]
@@ -2717,9 +2943,54 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("◇ BTW · local only"));
+        assert!(rendered.contains("◇ BTW sidechain"));
         assert!(rendered.contains("Q: side question"));
         assert!(rendered.contains("side answer"));
+    }
+
+    #[tokio::test]
+    async fn btw_sidechain_persists_and_recovers_independently() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be after the Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("mycode-btw-sidechain-{nonce}"));
+        fs::create_dir(&root).expect("sidechain fixture directory must be created");
+        let path = root.join("session.json.btw.json");
+        let mut store = BtwSidechainStore::load(path.clone())
+            .await
+            .expect("missing sidechain must start empty");
+        let first = LocalTranscriptEntry {
+            question: "first question".to_owned(),
+            answer: "first answer".to_owned(),
+        };
+        let second = LocalTranscriptEntry {
+            question: "follow-up".to_owned(),
+            answer: "follow-up answer".to_owned(),
+        };
+        store
+            .append(first.clone())
+            .await
+            .expect("first sidechain entry must persist");
+        store
+            .append(second.clone())
+            .await
+            .expect("follow-up sidechain entry must persist");
+
+        let recovered = BtwSidechainStore::load(path)
+            .await
+            .expect("persisted sidechain must reload");
+        assert_eq!(recovered.entries, vec![first, second]);
+        fs::remove_dir_all(root).expect("sidechain fixture must be removed");
+    }
+
+    #[test]
+    fn session_sidechain_uses_a_separate_sidecar_path() {
+        assert_eq!(
+            btw_sidechain_path(None, Some(Path::new("sessions/main.json")))
+                .expect("session sidechain path must resolve"),
+            Path::new("sessions/main.json.btw.json")
+        );
     }
 
     #[test]
