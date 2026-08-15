@@ -64,6 +64,8 @@ const COLOR_TOOL: Color = Color::Rgb(250, 204, 21);
 const COLOR_TEXT: Color = Color::Rgb(228, 228, 231);
 const COLOR_MUTED: Color = Color::Rgb(113, 113, 122);
 const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
+const COLLAPSED_COMMAND_LINES: usize = 2;
+const COLLAPSED_FILE_OUTPUT_LINES: usize = 8;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Provider {
@@ -1138,15 +1140,11 @@ fn push_wrapped_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, w
     }
 }
 
-fn push_indented_wrapped_line(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    style: Style,
-    width: u16,
-) {
+fn indented_wrapped_lines(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     if width == 0 {
-        return;
+        return Vec::new();
     }
+    let mut lines = Vec::new();
     for source_line in text.split('\n') {
         if source_line.is_empty() {
             lines.push(Line::from(Span::styled("  ", style)));
@@ -1159,9 +1157,34 @@ fn push_indented_wrapped_line(
             lines.push(Line::from(Span::styled(wrapped.into_owned(), style)));
         }
     }
+    lines
 }
 
-fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u16) {
+fn push_folded_lines(
+    lines: &mut Vec<Line<'static>>,
+    mut block: Vec<Line<'static>>,
+    expanded: bool,
+    visible_lines: usize,
+    kind: &str,
+) {
+    if !expanded && block.len() > visible_lines {
+        let hidden = block.len() - visible_lines;
+        lines.extend(block.drain(..visible_lines));
+        lines.push(Line::from(Span::styled(
+            format!("  … {hidden} {kind} lines hidden · Ctrl+E expand"),
+            Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
+        )));
+    } else {
+        lines.append(&mut block);
+    }
+}
+
+fn push_tool_call(
+    lines: &mut Vec<Line<'static>>,
+    call: &CoreToolCall,
+    width: u16,
+    expanded: bool,
+) {
     if width == 0 {
         return;
     }
@@ -1173,40 +1196,75 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u1
         .max(1);
     let summary = call.transcript_summary();
     let wrapped = textwrap::wrap(&summary, available);
-    for (index, row) in wrapped.iter().enumerate() {
+    let visible = if expanded {
+        wrapped.len()
+    } else {
+        wrapped.len().min(COLLAPSED_COMMAND_LINES)
+    };
+    for (index, row) in wrapped.iter().take(visible).enumerate() {
         let indent = if index == 0 { prefix } else { continuation };
-        let is_last = index + 1 == wrapped.len();
-        let suffix_fits = textwrap::core::display_width(indent)
-            + textwrap::core::display_width(row)
-            + textwrap::core::display_width(&suffix)
-            <= usize::from(width);
+        let is_last = index + 1 == visible;
+        let suffix_fits = expanded
+            && is_last
+            && textwrap::core::display_width(indent)
+                + textwrap::core::display_width(row)
+                + textwrap::core::display_width(&suffix)
+                <= usize::from(width);
         let mut spans = vec![
             Span::styled(indent, Style::default().fg(COLOR_MUTED)),
             Span::styled(row.clone().into_owned(), Style::default().fg(COLOR_ACCENT)),
         ];
-        if is_last && suffix_fits {
+        if suffix_fits {
             spans.push(Span::styled(
                 suffix.clone(),
                 Style::default().fg(COLOR_MUTED),
             ));
         }
         lines.push(Line::from(spans));
-        if is_last && !suffix_fits {
+    }
+    if !expanded && wrapped.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "     … {} command lines hidden · Ctrl+E expand  #{}",
+                wrapped.len() - visible,
+                call.call_id
+            ),
+            Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
+        )));
+    } else if expanded && !suffix.is_empty() && !wrapped.is_empty() {
+        let last = wrapped.last().expect("non-empty tool command summary");
+        let last_indent = if wrapped.len() == 1 { prefix } else { continuation };
+        if textwrap::core::display_width(last_indent)
+            + textwrap::core::display_width(last)
+            + textwrap::core::display_width(&suffix)
+            > usize::from(width)
+        {
             lines.push(Line::from(vec![
                 Span::styled(continuation, Style::default().fg(COLOR_MUTED)),
-                Span::styled(suffix.clone(), Style::default().fg(COLOR_MUTED)),
+                Span::styled(suffix, Style::default().fg(COLOR_MUTED)),
             ]));
         }
     }
 }
 
-fn build_transcript_lines(messages: &[CoreMessage], width: u16) -> Vec<Line<'static>> {
+fn build_transcript_lines(
+    messages: &[CoreMessage],
+    width: u16,
+    details_expanded: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let mut tool_calls: BTreeMap<&str, &CoreToolCall> = BTreeMap::new();
     for message in messages {
+        let source_call = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|call_id| tool_calls.get(call_id));
+        let is_file_result = message.role == "tool" && source_call.is_some_and(|call| call.name == "read");
         let (label, color, content_color) = match message.role.as_str() {
             "user" => ("› You", COLOR_USER, COLOR_TEXT),
             "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
             "tool" if message.is_error => ("! Tool error", COLOR_ERROR, COLOR_ERROR),
+            "tool" if is_file_result => ("└ File result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
             "tool" => ("└ Tool result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
             _ => ("· Message", COLOR_MUTED, COLOR_TEXT),
         };
@@ -1217,15 +1275,26 @@ fn build_transcript_lines(messages: &[CoreMessage], width: u16) -> Vec<Line<'sta
             width,
         );
         if !message.content.is_empty() {
-            push_indented_wrapped_line(
-                &mut lines,
+            let content_lines = indented_wrapped_lines(
                 &message.content,
                 Style::default().fg(content_color),
                 width,
             );
+            if message.role == "tool" {
+                push_folded_lines(
+                    &mut lines,
+                    content_lines,
+                    details_expanded,
+                    COLLAPSED_FILE_OUTPUT_LINES,
+                    if is_file_result { "file output" } else { "tool output" },
+                );
+            } else {
+                lines.extend(content_lines);
+            }
         }
         for call in &message.tool_calls {
-            push_tool_call(&mut lines, call, width);
+            push_tool_call(&mut lines, call, width, details_expanded);
+            tool_calls.insert(call.call_id.as_str(), call);
         }
         lines.push(Line::default());
     }
@@ -1245,6 +1314,7 @@ struct App {
     transcript_top: u16,
     transcript_bottom: u16,
     transcript_revision: u64,
+    transcript_details_expanded: bool,
     transcript_layout: Option<TranscriptLayoutCache>,
 }
 
@@ -1263,6 +1333,7 @@ impl App {
             transcript_top: 0,
             transcript_bottom: 0,
             transcript_revision: 0,
+            transcript_details_expanded: false,
             transcript_layout: None,
         }
     }
@@ -1277,6 +1348,12 @@ impl App {
         }
     }
 
+    fn toggle_transcript_details(&mut self) {
+        self.transcript_details_expanded = !self.transcript_details_expanded;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_layout = None;
+    }
+
     fn visible_transcript(&mut self, width: u16, height: u16) -> Text<'static> {
         let rebuild = self
             .transcript_layout
@@ -1286,7 +1363,11 @@ impl App {
             self.transcript_layout = Some(TranscriptLayoutCache {
                 revision: self.transcript_revision,
                 width,
-                lines: build_transcript_lines(&self.snapshot.messages, width),
+                lines: build_transcript_lines(
+                    &self.snapshot.messages,
+                    width,
+                    self.transcript_details_expanded,
+                ),
             });
         }
         let lines = &self
@@ -1906,7 +1987,6 @@ async fn cancel_and_wait(active: &mut Option<ActiveRuntime>, app: &mut App) {
     app.status = "Cancelling…".to_owned();
     let _ = active.handle.await;
 }
-
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let [header, transcript, input, status] = Layout::vertical([
         Constraint::Length(1),
@@ -2026,7 +2106,8 @@ fn default_git_plugin_path() -> PathBuf {
     if let Some(path) = env::var_os("LEAN_AGENT_GIT_PLUGIN_BIN") {
         return PathBuf::from(path);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/agent-git-plugin")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lean_agent_core/.lake/build/bin/lean_agent_git_plugin")
 }
 
 #[cfg(test)]

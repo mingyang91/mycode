@@ -12,3 +12,11 @@ root = "Main"
 [[lean_exe]]
 name = "lean_agent_core_tests"
 root = "Tests"
+
+[[lean_exe]]
+name = "lean_agent_git_plugin"
+root = "GitPluginMain"
+
+[[lean_exe]]
+name = "lean_agent_git_plugin_tests"
+root = "GitPluginTests"
