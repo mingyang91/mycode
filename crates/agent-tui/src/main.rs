@@ -36,7 +36,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, mpsc},
     task::JoinHandle,
-    time::timeout,
+    time::{MissedTickBehavior, interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -56,6 +56,7 @@ const CORE_PROTOCOL_VERSION: u64 = 1;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const COLOR_ACCENT: Color = Color::Rgb(139, 92, 246);
 const COLOR_USER: Color = Color::Rgb(56, 189, 248);
 const COLOR_ASSISTANT: Color = Color::Rgb(74, 222, 128);
@@ -121,7 +122,7 @@ enum AppError {
     UnsupportedSessionPhase { phase: String },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CoreToolCall {
     call_id: String,
@@ -149,7 +150,7 @@ impl CoreToolCall {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CoreMessage {
     role: String,
@@ -1116,18 +1117,135 @@ fn anthropic_messages(messages: &[CoreMessage]) -> Vec<Value> {
     result
 }
 
+struct TranscriptLayoutCache {
+    revision: u64,
+    width: u16,
+    lines: Vec<Line<'static>>,
+}
+
+fn push_wrapped_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: u16) {
+    if width == 0 {
+        return;
+    }
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            lines.push(Line::default());
+            continue;
+        }
+        for wrapped in textwrap::wrap(source_line, usize::from(width)) {
+            lines.push(Line::from(Span::styled(wrapped.into_owned(), style)));
+        }
+    }
+}
+
+fn push_indented_wrapped_line(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    style: Style,
+    width: u16,
+) {
+    if width == 0 {
+        return;
+    }
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            lines.push(Line::from(Span::styled("  ", style)));
+            continue;
+        }
+        let options = textwrap::Options::new(usize::from(width))
+            .initial_indent("  ")
+            .subsequent_indent("  ");
+        for wrapped in textwrap::wrap(source_line, options) {
+            lines.push(Line::from(Span::styled(wrapped.into_owned(), style)));
+        }
+    }
+}
+
+fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u16) {
+    if width == 0 {
+        return;
+    }
+    let prefix = "  └─ ";
+    let continuation = "     ";
+    let suffix = format!("  #{}", call.call_id);
+    let available = usize::from(width)
+        .saturating_sub(textwrap::core::display_width(prefix))
+        .max(1);
+    let summary = call.transcript_summary();
+    let wrapped = textwrap::wrap(&summary, available);
+    for (index, row) in wrapped.iter().enumerate() {
+        let indent = if index == 0 { prefix } else { continuation };
+        let is_last = index + 1 == wrapped.len();
+        let suffix_fits = textwrap::core::display_width(indent)
+            + textwrap::core::display_width(row)
+            + textwrap::core::display_width(&suffix)
+            <= usize::from(width);
+        let mut spans = vec![
+            Span::styled(indent, Style::default().fg(COLOR_MUTED)),
+            Span::styled(row.clone().into_owned(), Style::default().fg(COLOR_ACCENT)),
+        ];
+        if is_last && suffix_fits {
+            spans.push(Span::styled(
+                suffix.clone(),
+                Style::default().fg(COLOR_MUTED),
+            ));
+        }
+        lines.push(Line::from(spans));
+        if is_last && !suffix_fits {
+            lines.push(Line::from(vec![
+                Span::styled(continuation, Style::default().fg(COLOR_MUTED)),
+                Span::styled(suffix.clone(), Style::default().fg(COLOR_MUTED)),
+            ]));
+        }
+    }
+}
+
+fn build_transcript_lines(messages: &[CoreMessage], width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for message in messages {
+        let (label, color, content_color) = match message.role.as_str() {
+            "user" => ("› You", COLOR_USER, COLOR_TEXT),
+            "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
+            "tool" if message.is_error => ("! Tool error", COLOR_ERROR, COLOR_ERROR),
+            "tool" => ("└ Tool result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
+            _ => ("· Message", COLOR_MUTED, COLOR_TEXT),
+        };
+        push_wrapped_line(
+            &mut lines,
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            width,
+        );
+        if !message.content.is_empty() {
+            push_indented_wrapped_line(
+                &mut lines,
+                &message.content,
+                Style::default().fg(content_color),
+                width,
+            );
+        }
+        for call in &message.tool_calls {
+            push_tool_call(&mut lines, call, width);
+        }
+        lines.push(Line::default());
+    }
+    lines
+}
+
 struct App {
     input: String,
     status: String,
     snapshot: CoreSnapshot,
     approval: Option<CoreToolCall>,
     busy: bool,
-    scroll_offset: u16,
-    max_scroll: u16,
-    page_rows: u16,
+    scroll_offset: usize,
+    max_scroll: usize,
+    page_rows: usize,
     follow_tail: bool,
     transcript_top: u16,
     transcript_bottom: u16,
+    transcript_revision: u64,
+    transcript_layout: Option<TranscriptLayoutCache>,
 }
 
 impl App {
@@ -1144,47 +1262,51 @@ impl App {
             follow_tail: true,
             transcript_top: 0,
             transcript_bottom: 0,
+            transcript_revision: 0,
+            transcript_layout: None,
         }
     }
 
-    fn transcript(&self) -> Text<'static> {
-        let mut lines = Vec::new();
-        for message in &self.snapshot.messages {
-            let (label, color, content_color) = match message.role.as_str() {
-                "user" => ("› You", COLOR_USER, COLOR_TEXT),
-                "assistant" => ("• Assistant", COLOR_ASSISTANT, COLOR_TEXT),
-                "tool" if message.is_error => ("! Tool error", COLOR_ERROR, COLOR_ERROR),
-                "tool" => ("└ Tool result", COLOR_TOOL, Color::Rgb(161, 161, 170)),
-                _ => ("· Message", COLOR_MUTED, COLOR_TEXT),
-            };
-            lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )));
-            if !message.content.is_empty() {
-                for content in message.content.split('\n') {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(content.to_owned(), Style::default().fg(content_color)),
-                    ]));
-                }
-            }
-            for call in &message.tool_calls {
-                lines.push(Line::from(vec![
-                    Span::styled("  └─ ", Style::default().fg(COLOR_MUTED)),
-                    Span::styled(call.transcript_summary(), Style::default().fg(COLOR_ACCENT)),
-                    Span::styled(
-                        format!("  #{}", call.call_id),
-                        Style::default().fg(COLOR_MUTED),
-                    ),
-                ]));
-            }
-            lines.push(Line::default());
+    fn set_snapshot(&mut self, snapshot: CoreSnapshot) {
+        let transcript_changed = self.snapshot.messages.len() != snapshot.messages.len()
+            || self.snapshot.messages.last() != snapshot.messages.last();
+        self.snapshot = snapshot;
+        if transcript_changed {
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            self.transcript_layout = None;
         }
-        Text::from(lines)
     }
 
-    fn scroll_up(&mut self, rows: u16) {
+    fn visible_transcript(&mut self, width: u16, height: u16) -> Text<'static> {
+        let rebuild = self
+            .transcript_layout
+            .as_ref()
+            .is_none_or(|cache| cache.revision != self.transcript_revision || cache.width != width);
+        if rebuild {
+            self.transcript_layout = Some(TranscriptLayoutCache {
+                revision: self.transcript_revision,
+                width,
+                lines: build_transcript_lines(&self.snapshot.messages, width),
+            });
+        }
+        let lines = &self
+            .transcript_layout
+            .as_ref()
+            .expect("transcript layout was initialized")
+            .lines;
+        self.max_scroll = lines.len().saturating_sub(usize::from(height));
+        self.page_rows = usize::from(height.max(1));
+        if self.follow_tail {
+            self.scroll_offset = self.max_scroll;
+        } else {
+            self.scroll_offset = self.scroll_offset.min(self.max_scroll);
+        }
+        let start = self.scroll_offset.min(lines.len());
+        let end = start.saturating_add(usize::from(height)).min(lines.len());
+        Text::from(lines[start..end].to_vec())
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
         if self.max_scroll == 0 {
             return;
         }
@@ -1197,7 +1319,7 @@ impl App {
         self.follow_tail = false;
     }
 
-    fn scroll_down(&mut self, rows: u16) {
+    fn scroll_down(&mut self, rows: usize) {
         let current = if self.follow_tail {
             self.max_scroll
         } else {
@@ -1225,14 +1347,22 @@ impl App {
         self.follow_tail = true;
     }
 
-    fn handle_mouse(&mut self, event: MouseEvent) {
+    fn scroll_delta(&mut self, delta: i32) {
+        if delta < 0 {
+            self.scroll_up(delta.unsigned_abs() as usize);
+        } else if delta > 0 {
+            self.scroll_down(delta.unsigned_abs() as usize);
+        }
+    }
+
+    fn mouse_scroll_delta(&self, event: MouseEvent) -> i32 {
         if event.row < self.transcript_top || event.row >= self.transcript_bottom {
-            return;
+            return 0;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll_up(3),
-            MouseEventKind::ScrollDown => self.scroll_down(3),
-            _ => {}
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => 0,
         }
     }
 }
@@ -1324,7 +1454,7 @@ async fn main() -> Result<(), AppError> {
     let initial_action = match app.snapshot.phase.as_str() {
         "idle" => {
             let configured = core.event(&CoreEvent::configure_tools(safe_tools)).await?;
-            app.snapshot = configured.snapshot;
+            app.set_snapshot(configured.snapshot);
             args.prompt.clone().map(RuntimeAction::Submit)
         }
         "waiting_model" => {
@@ -1449,8 +1579,12 @@ async fn tui_loop(
         app.status = "Starting…".to_owned();
         spawn_runtime_action(Arc::clone(&runtime), action, updates.clone())
     });
+    let mut frame_tick = interval(FRAME_INTERVAL);
+    frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut dirty = true;
+    let mut pending_scroll = 0_i32;
+
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
         tokio::select! {
             event = events.next() => {
                 let Some(event) = event else {
@@ -1459,6 +1593,11 @@ async fn tui_loop(
                 };
                 match event? {
                     CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                        if pending_scroll != 0 {
+                            app.scroll_delta(pending_scroll);
+                            pending_scroll = 0;
+                        }
+                        dirty = true;
                         match handle_key(key, app) {
                             KeyAction::None => {}
                             KeyAction::Quit => {
@@ -1488,26 +1627,34 @@ async fn tui_loop(
                             KeyAction::Submit(_) | KeyAction::Approval { .. } => {}
                         }
                     }
-                    CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse),
-                    CrosstermEvent::Resize(_, _) => {}
+                    CrosstermEvent::Mouse(mouse) => {
+                        let delta = app.mouse_scroll_delta(mouse);
+                        if delta != 0 {
+                            pending_scroll = pending_scroll.saturating_add(delta);
+                            dirty = true;
+                        }
+                    }
+                    CrosstermEvent::Resize(_, _) => dirty = true,
                     _ => {}
                 }
             }
             update = update_rx.recv() => {
                 match update {
                     Some(RuntimeUpdate::Progress { snapshot, status }) => {
-                        app.snapshot = snapshot;
+                        app.set_snapshot(snapshot);
                         app.status = status;
                         app.busy = true;
+                        dirty = true;
                     }
                     Some(RuntimeUpdate::Settled(final_state)) => {
                         if let Some(active) = active.take() {
                             let _ = active.handle.await;
                         }
-                        app.snapshot = final_state.snapshot;
+                        app.set_snapshot(final_state.snapshot);
                         app.status = final_state.status;
                         app.approval = final_state.approval;
                         app.busy = false;
+                        dirty = true;
                     }
                     Some(RuntimeUpdate::Failed(error)) => {
                         if let Some(active) = active.take() {
@@ -1515,9 +1662,18 @@ async fn tui_loop(
                         }
                         app.status = format!("Error: {error}");
                         app.busy = false;
+                        dirty = true;
                     }
                     None => return Ok(()),
                 }
+            }
+            _ = frame_tick.tick(), if dirty || pending_scroll != 0 => {
+                if pending_scroll != 0 {
+                    app.scroll_delta(pending_scroll);
+                    pending_scroll = 0;
+                }
+                terminal.draw(|frame| draw(frame, app))?;
+                dirty = false;
             }
         }
     }
@@ -1786,24 +1942,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         header,
     );
 
-    let transcript_block = Block::default().padding(Padding::horizontal(1));
-    let transcript_paragraph = Paragraph::new(app.transcript())
-        .block(transcript_block)
-        .wrap(Wrap { trim: false });
-    let rendered_lines = transcript_paragraph.line_count(transcript.width.saturating_sub(2));
+    let content_width = transcript.width.saturating_sub(2);
     let content_height = transcript.height;
-    app.max_scroll = u16::try_from(rendered_lines.saturating_sub(usize::from(content_height)))
-        .unwrap_or(u16::MAX);
-    app.page_rows = content_height.max(1);
+    let visible_transcript = app.visible_transcript(content_width, content_height);
     app.transcript_top = transcript.y;
     app.transcript_bottom = transcript.y.saturating_add(transcript.height);
-    if app.follow_tail {
-        app.scroll_offset = app.max_scroll;
-    } else {
-        app.scroll_offset = app.scroll_offset.min(app.max_scroll);
-    }
     frame.render_widget(
-        transcript_paragraph.scroll((app.scroll_offset, 0)),
+        Paragraph::new(visible_transcript).block(Block::default().padding(Padding::horizontal(1))),
         transcript,
     );
 
@@ -1887,10 +2032,11 @@ fn default_git_plugin_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
-        App, CoreMessage, CoreSnapshot, CoreToolCall, anthropic_messages, draw,
+        App, COLOR_ACCENT, COLOR_MUTED, CoreMessage, CoreSnapshot, CoreToolCall,
+        TranscriptLayoutCache, anthropic_messages, build_transcript_lines, draw,
         parse_openai_tool_calls,
     };
 
@@ -1931,6 +2077,38 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn cached_layout_preserves_multiline_indent_and_tool_styles() {
+        let lines = build_transcript_lines(
+            &[
+                CoreMessage {
+                    role: "tool".to_owned(),
+                    content: "first\nsecond".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    tool_calls: vec![CoreToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "bash".to_owned(),
+                        arguments: serde_json::json!({"command": "git status --short"}),
+                    }],
+                    ..CoreMessage::default()
+                },
+            ],
+            80,
+        );
+        assert_eq!(lines[1].to_string(), "  first");
+        assert_eq!(lines[2].to_string(), "  second");
+        let tool_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("git status --short"))
+            .expect("tool line must be present");
+        assert_eq!(tool_line.spans[0].style.fg, Some(COLOR_MUTED));
+        assert_eq!(tool_line.spans[1].style.fg, Some(COLOR_ACCENT));
+        assert_eq!(tool_line.spans[2].style.fg, Some(COLOR_MUTED));
     }
 
     #[test]
@@ -2040,21 +2218,23 @@ mod tests {
         app.transcript_top = 2;
         app.transcript_bottom = 12;
 
-        app.handle_mouse(MouseEvent {
+        let inside = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 3,
             row: 5,
             modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.scroll_offset, 17);
+        };
+        app.scroll_delta(app.mouse_scroll_delta(inside));
+        assert_eq!(app.scroll_offset, 19);
 
-        app.handle_mouse(MouseEvent {
+        let outside = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 3,
             row: 15,
             modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.scroll_offset, 17);
+        };
+        app.scroll_delta(app.mouse_scroll_delta(outside));
+        assert_eq!(app.scroll_offset, 19);
     }
 
     #[test]
@@ -2082,7 +2262,7 @@ mod tests {
             .draw(|frame| draw(frame, &mut app))
             .expect("padded transcript must draw");
 
-        let rendered_lines = 7_u16;
+        let rendered_lines = 7_usize;
         assert_eq!(app.max_scroll, rendered_lines.saturating_sub(app.page_rows));
         assert_eq!(app.scroll_offset, app.max_scroll);
         assert!(app.follow_tail);
@@ -2110,19 +2290,46 @@ mod tests {
         let initial_max = app.max_scroll;
         assert!(initial_max > 0);
         assert_eq!(app.scroll_offset, initial_max);
+        let initial_cache = app
+            .transcript_layout
+            .as_ref()
+            .expect("initial draw must build the transcript cache");
+        let initial_revision = initial_cache.revision;
+        let initial_lines = initial_cache.lines.as_ptr();
+
+        app.scroll_up(1);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("scroll-only frame must draw");
+        let scrolled_cache = app
+            .transcript_layout
+            .as_ref()
+            .expect("scrolling must retain the transcript cache");
+        assert_eq!(scrolled_cache.revision, initial_revision);
+        assert_eq!(scrolled_cache.lines.as_ptr(), initial_lines);
 
         app.scroll_up(3);
         let pinned_offset = app.scroll_offset;
-        app.snapshot.messages.push(CoreMessage {
+        let mut updated = app.snapshot.clone();
+        updated.messages.push(CoreMessage {
             role: "assistant".to_owned(),
             content: "new tail content".repeat(8),
             ..CoreMessage::default()
         });
+        app.set_snapshot(updated);
+        assert!(app.transcript_layout.is_none());
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("scrolled frame must draw");
         assert!(app.max_scroll > initial_max);
         assert_eq!(app.scroll_offset, pinned_offset);
+        assert_ne!(
+            app.transcript_layout
+                .as_ref()
+                .expect("message append must rebuild the transcript cache")
+                .revision,
+            initial_revision
+        );
 
         app.scroll_end();
         terminal
@@ -2130,5 +2337,19 @@ mod tests {
             .expect("tail frame must draw");
         assert_eq!(app.scroll_offset, app.max_scroll);
         assert!(app.follow_tail);
+    }
+
+    #[test]
+    fn tail_following_supports_more_than_u16_rows() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.transcript_layout = Some(TranscriptLayoutCache {
+            revision: app.transcript_revision,
+            width: 80,
+            lines: vec![Line::default(); 70_000],
+        });
+        let visible = app.visible_transcript(80, 20);
+        assert_eq!(visible.height(), 20);
+        assert_eq!(app.max_scroll, 69_980);
+        assert_eq!(app.scroll_offset, 69_980);
     }
 }
