@@ -13,6 +13,7 @@ unsafe_op_in_unsafe_fn = "deny"
 unwrap_used = "deny"
 
 [dependencies]
+base64.workspace = true
 mycode-plugin-protocol = { path = "../mycode-plugin-protocol" }
 clap.workspace = true
 crossterm.workspace = true

@@ -7,10 +7,12 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - `mycode/` owns the authoritative agent state machine, tool ordering, approval decisions, session snapshots, and restart recovery.
 - `crates/mycode-tui/` owns terminal input/rendering, direct OpenAI and Anthropic adapters, the OMP-backed Linewise OpenAI gateway adapter, and asynchronous realization of Lean effects.
 - `crates/mycode-plugin-protocol/` owns the versioned external-plugin wire contract: four-byte big-endian length followed by bounded UTF-8 JSON.
-- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` and `grep` are automatically safe; `write`, `edit`, and `bash` require a Lean approval effect.
+- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` and `grep` are always safe; Lean permission modes decide whether `write`, `edit`, and `bash` run automatically or require approval. Bash emits bounded, correlated stdout/stderr progress frames before its terminal result.
 - Rust must never execute a model-proposed tool merely because it parsed a provider response. It may invoke a plugin only after the Lean core emits `invoke_tool`.
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.
+- Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
+- The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
 
 ## Lean rules
 
@@ -51,7 +53,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → plugin tool → model completion, cooperative Escape cancellation, and a clean TUI exit.
+For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
 
 ## Git
 

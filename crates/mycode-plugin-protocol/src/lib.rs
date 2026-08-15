@@ -122,6 +122,36 @@ pub struct ToolResult {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProgress {
+    pub stream: ToolOutputStream,
+    /// Base64-encoded bytes. The consumer decodes before applying UTF-8 loss replacement.
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressEnvelope {
+    pub v: u16,
+    pub id: String,
+    pub progress: ToolProgress,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PluginMessage {
+    Progress(ProgressEnvelope),
+    Response(ResponseEnvelope),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginErrorCode {
@@ -253,6 +283,18 @@ pub fn validate_response(response: &ResponseEnvelope) -> Result<(), ProtocolErro
     }
 }
 
+pub fn validate_progress(progress: &ProgressEnvelope) -> Result<(), ProtocolError> {
+    validate_version(progress.v)?;
+    validate_correlation_id(&progress.id)?;
+    if progress.progress.data.len() > DEFAULT_MAX_FRAME_BYTES / 2 {
+        return Err(ProtocolError::FrameTooLarge {
+            declared: progress.progress.data.len(),
+            maximum: DEFAULT_MAX_FRAME_BYTES / 2,
+        });
+    }
+    Ok(())
+}
+
 pub async fn read_request<R>(
     reader: &mut R,
     max_frame_bytes: usize,
@@ -277,6 +319,21 @@ where
     Ok(response)
 }
 
+pub async fn read_plugin_message<R>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Result<PluginMessage, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    let message: PluginMessage = read_frame(reader, max_frame_bytes).await?;
+    match &message {
+        PluginMessage::Progress(progress) => validate_progress(progress)?,
+        PluginMessage::Response(response) => validate_response(response)?,
+    }
+    Ok(message)
+}
+
 pub async fn write_request<W>(
     writer: &mut W,
     request: &RequestEnvelope,
@@ -286,6 +343,17 @@ where
 {
     validate_request(request)?;
     write_frame(writer, request).await
+}
+
+pub async fn write_progress<W>(
+    writer: &mut W,
+    progress: &ProgressEnvelope,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    validate_progress(progress)?;
+    write_frame(writer, progress).await
 }
 
 pub async fn write_response<W>(
@@ -391,8 +459,9 @@ mod tests {
     use tokio::io::duplex;
 
     use super::{
-        CallToolParams, DEFAULT_MAX_FRAME_BYTES, EmptyParams, PROTOCOL_VERSION, ProtocolError,
-        RequestEnvelope, RequestOperation, read_request, write_request,
+        CallToolParams, DEFAULT_MAX_FRAME_BYTES, EmptyParams, PROTOCOL_VERSION, PluginMessage,
+        ProgressEnvelope, ProtocolError, RequestEnvelope, RequestOperation, ToolOutputStream,
+        ToolProgress, read_plugin_message, read_request, write_progress, write_request,
     };
 
     #[tokio::test]
@@ -413,6 +482,30 @@ mod tests {
             .await
             .expect("request must deserialize");
         assert_eq!(decoded.id, request.id);
+    }
+
+    #[tokio::test]
+    async fn round_trips_a_tool_progress_frame() {
+        let (mut writer, mut reader) = duplex(4096);
+        let progress = ProgressEnvelope {
+            v: PROTOCOL_VERSION,
+            id: "call_1".to_owned(),
+            progress: ToolProgress {
+                stream: ToolOutputStream::Stderr,
+                data: "d2FybmluZw==".to_owned(),
+            },
+        };
+        write_progress(&mut writer, &progress)
+            .await
+            .expect("progress must serialize");
+        let decoded = read_plugin_message(&mut reader, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .expect("progress must deserialize");
+        let PluginMessage::Progress(decoded) = decoded else {
+            panic!("expected progress frame");
+        };
+        assert_eq!(decoded.id, "call_1");
+        assert_eq!(decoded.progress.stream, ToolOutputStream::Stderr);
     }
 
     #[tokio::test]

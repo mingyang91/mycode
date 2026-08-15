@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::Show;
 use crossterm::{
@@ -21,9 +22,10 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use mycode_plugin_protocol::{
-    CallToolParams, DEFAULT_MAX_FRAME_BYTES, InitializeParams, InitializeResult, Limits,
-    RequestEnvelope as PluginRequest, RequestOperation as PluginOperation, ToolListResult,
-    ToolResult, ToolSpec, read_response, write_request,
+    CallToolParams, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_TOOL_OUTPUT_BYTES, InitializeParams,
+    InitializeResult, Limits, PluginMessage, RequestEnvelope as PluginRequest,
+    RequestOperation as PluginOperation, ToolListResult, ToolOutputStream, ToolProgress,
+    ToolResult, ToolSpec, read_plugin_message, read_response, write_request,
 };
 #[cfg(unix)]
 use nix::{
@@ -64,6 +66,7 @@ const COLOR_TOOL: Color = Color::Rgb(250, 204, 21);
 const COLOR_TEXT: Color = Color::Rgb(228, 228, 231);
 const COLOR_MUTED: Color = Color::Rgb(113, 113, 122);
 const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
+const COLLAPSED_LIVE_TAIL_LINES: usize = 4;
 const COLLAPSED_COMMAND_LINES: usize = 2;
 const COLLAPSED_FILE_OUTPUT_LINES: usize = 8;
 
@@ -72,6 +75,23 @@ enum Provider {
     Openai,
     Anthropic,
     Linewise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PermissionMode {
+    Ask,
+    Auto,
+    Yolo,
+}
+
+impl PermissionMode {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Yolo => "yolo",
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +118,8 @@ struct Args {
     system_prompt: String,
     #[arg(long)]
     prompt: Option<String>,
+    #[arg(long, value_enum, default_value = "auto")]
+    permission_mode: PermissionMode,
 }
 
 #[derive(Debug, Error)]
@@ -122,6 +144,51 @@ enum AppError {
     MissingPendingTool { phase: String },
     #[error("persisted session has an unsupported phase: {phase}")]
     UnsupportedSessionPhase { phase: String },
+    #[error("plugin progress carried invalid base64: {0}")]
+    ToolProgressEncoding(#[from] base64::DecodeError),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum SlashCommandError {
+    #[error("usage: /btw <question>")]
+    MissingBtwQuestion,
+    #[error("usage: /exit")]
+    ExitTakesNoArguments,
+    #[error("unknown slash command: /{0}")]
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SlashCommand {
+    Btw(String),
+    Exit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UserSubmission {
+    Prompt(String),
+    Command(SlashCommand),
+}
+
+fn parse_submission(text: String) -> Result<UserSubmission, SlashCommandError> {
+    if let Some(literal) = text.strip_prefix("//") {
+        return Ok(UserSubmission::Prompt(format!("/{literal}")));
+    }
+    let Some(command) = text.strip_prefix('/') else {
+        return Ok(UserSubmission::Prompt(text));
+    };
+    let (name, arguments) = command
+        .split_once(char::is_whitespace)
+        .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
+    match name {
+        "btw" if arguments.is_empty() => Err(SlashCommandError::MissingBtwQuestion),
+        "btw" => Ok(UserSubmission::Command(SlashCommand::Btw(
+            arguments.to_owned(),
+        ))),
+        "exit" if arguments.is_empty() => Ok(UserSubmission::Command(SlashCommand::Exit)),
+        "exit" => Err(SlashCommandError::ExitTakesNoArguments),
+        name => Err(SlashCommandError::Unknown(name.to_owned())),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -183,10 +250,16 @@ struct CoreEvent {
     is_error: Option<bool>,
     #[serde(default)]
     safe_tools: Vec<String>,
+    #[serde(default = "default_permission_mode")]
+    permission_mode: String,
+}
+
+fn default_permission_mode() -> String {
+    "ask".to_owned()
 }
 
 impl CoreEvent {
-    fn configure_tools(safe_tools: Vec<String>) -> Self {
+    fn configure_tools(safe_tools: Vec<String>, permission_mode: PermissionMode) -> Self {
         Self {
             kind: "configure_tools".to_owned(),
             text: None,
@@ -196,6 +269,7 @@ impl CoreEvent {
             content: None,
             is_error: None,
             safe_tools,
+            permission_mode: permission_mode.wire_value().to_owned(),
         }
     }
 
@@ -209,6 +283,7 @@ impl CoreEvent {
             content: None,
             is_error: None,
             safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
         }
     }
 
@@ -222,6 +297,7 @@ impl CoreEvent {
             content: Some(content),
             is_error: None,
             safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
         }
     }
 
@@ -235,6 +311,7 @@ impl CoreEvent {
             content: None,
             is_error: None,
             safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
         }
     }
 
@@ -248,6 +325,7 @@ impl CoreEvent {
             content: Some(content),
             is_error: Some(is_error),
             safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
         }
     }
 
@@ -261,6 +339,7 @@ impl CoreEvent {
             content: None,
             is_error: None,
             safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
         }
     }
 }
@@ -284,6 +363,8 @@ struct CoreSnapshot {
     current_call: u64,
     #[serde(default)]
     safe_tools: Vec<String>,
+    #[serde(default = "default_permission_mode")]
+    permission_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,7 +605,14 @@ impl PluginClient {
         })
     }
 
-    async fn call(&mut self, call: &CoreToolCall) -> Result<ToolResult, PluginClientError> {
+    async fn call<F>(
+        &mut self,
+        call: &CoreToolCall,
+        mut on_progress: F,
+    ) -> Result<ToolResult, PluginClientError>
+    where
+        F: FnMut(ToolProgress),
+    {
         if !self.available {
             return Err(PluginClientError::Retired);
         }
@@ -545,27 +633,40 @@ impl PluginClient {
             self.retire().await;
             return Err(error.into());
         }
-        let response = match timeout(
-            Duration::from_secs(300),
-            read_response(&mut self.output, DEFAULT_MAX_FRAME_BYTES),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                self.retire().await;
-                return Err(error.into());
+        loop {
+            let message = match timeout(
+                Duration::from_secs(300),
+                read_plugin_message(&mut self.output, DEFAULT_MAX_FRAME_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => {
+                    self.retire().await;
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    self.retire().await;
+                    return Err(PluginClientError::DeadlineExceeded);
+                }
+            };
+            match message {
+                PluginMessage::Progress(progress) => {
+                    if progress.id != request_id {
+                        self.retire().await;
+                        return Err(PluginClientError::CorrelationMismatch);
+                    }
+                    on_progress(progress.progress);
+                }
+                PluginMessage::Response(response) => {
+                    if response.id != request_id {
+                        self.retire().await;
+                        return Err(PluginClientError::CorrelationMismatch);
+                    }
+                    return response.into_result().map_err(PluginClientError::from);
+                }
             }
-            Err(_) => {
-                self.retire().await;
-                return Err(PluginClientError::DeadlineExceeded);
-            }
-        };
-        if response.id != request_id {
-            self.retire().await;
-            return Err(PluginClientError::CorrelationMismatch);
         }
-        response.into_result().map_err(PluginClientError::from)
     }
 
     async fn retire(&mut self) {
@@ -691,14 +792,21 @@ impl PluginManager {
         Ok(())
     }
 
-    async fn call(&mut self, call: &CoreToolCall) -> Result<ToolResult, PluginClientError> {
+    async fn call<F>(
+        &mut self,
+        call: &CoreToolCall,
+        on_progress: F,
+    ) -> Result<ToolResult, PluginClientError>
+    where
+        F: FnMut(ToolProgress),
+    {
         let index = self
             .routes
             .get(&call.name)
             .copied()
             .ok_or_else(|| PluginClientError::UnknownTool(call.name.clone()))?;
         self.ensure_plugin(index).await?;
-        self.plugins[index].client.call(call).await
+        self.plugins[index].client.call(call, on_progress).await
     }
 
     async fn retire(&mut self) {
@@ -820,6 +928,23 @@ impl ModelClient {
         Ok(completion)
     }
 
+    async fn complete_text_only(
+        &self,
+        snapshot: &CoreSnapshot,
+        question: &str,
+    ) -> Result<String, ProviderError> {
+        let mut side_snapshot = snapshot.clone();
+        side_snapshot.messages.push(CoreMessage {
+            role: "user".to_owned(),
+            content: format!(
+                "[One-off BTW side question. Answer directly without continuing or changing the main task.]\n\n{question}"
+            ),
+            ..CoreMessage::default()
+        });
+        let completion = self.complete(&side_snapshot, &[]).await?;
+        Ok(completion.content)
+    }
+
     async fn complete_openai(
         &self,
         snapshot: &CoreSnapshot,
@@ -872,6 +997,15 @@ impl ModelClient {
                 })
             })
             .collect();
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false
+        });
+        if !tools.is_empty() {
+            request["tools"] = json!(tools);
+            request["tool_choice"] = json!("auto");
+        }
         let response = self
             .http
             .post(format!(
@@ -879,13 +1013,7 @@ impl ModelClient {
                 self.base_url.trim_end_matches('/')
             ))
             .bearer_auth(&self.api_key)
-            .json(&json!({
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": "auto",
-                "stream": false
-            }))
+            .json(&request)
             .send()
             .await?;
         let payload = response_json(response).await?;
@@ -928,18 +1056,21 @@ impl ModelClient {
                 })
             })
             .collect();
+        let mut request = json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": self.system_prompt,
+            "messages": messages
+        });
+        if !tools.is_empty() {
+            request["tools"] = json!(tools);
+        }
         let response = self
             .http
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(&json!({
-                "model": self.model,
-                "max_tokens": 4096,
-                "system": self.system_prompt,
-                "messages": messages,
-                "tools": tools
-            }))
+            .json(&request)
             .send()
             .await?;
         let payload = response_json(response).await?;
@@ -1125,6 +1256,12 @@ struct TranscriptLayoutCache {
     lines: Vec<Line<'static>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalTranscriptEntry {
+    question: String,
+    answer: String,
+}
+
 fn push_wrapped_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: u16) {
     if width == 0 {
         return;
@@ -1160,20 +1297,116 @@ fn indented_wrapped_lines(text: &str, style: Style, width: u16) -> Vec<Line<'sta
     lines
 }
 
+struct LiveToolOutput {
+    call_id: String,
+    label: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl LiveToolOutput {
+    fn new(call_id: String, label: String) -> Self {
+        Self {
+            call_id,
+            label,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, stream: ToolOutputStream, bytes: &[u8]) {
+        let destination = match stream {
+            ToolOutputStream::Stdout => &mut self.stdout,
+            ToolOutputStream::Stderr => &mut self.stderr,
+        };
+        destination.extend_from_slice(bytes);
+        if destination.len() > DEFAULT_MAX_TOOL_OUTPUT_BYTES {
+            let excess = destination.len() - DEFAULT_MAX_TOOL_OUTPUT_BYTES;
+            destination.drain(..excess);
+        }
+    }
+}
+
+fn tail_text(bytes: &[u8], lines: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let all = text.lines().collect::<Vec<_>>();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+fn build_live_tool_lines(live: &LiveToolOutput, width: u16, expanded: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("└ Running · {}  #{}", live.label, live.call_id),
+        Style::default().fg(COLOR_TOOL).add_modifier(Modifier::BOLD),
+    ))];
+    for (label, bytes, color) in [
+        ("stdout", live.stdout.as_slice(), COLOR_TEXT),
+        ("stderr", live.stderr.as_slice(), COLOR_ERROR),
+    ] {
+        if bytes.is_empty() {
+            continue;
+        }
+        let content = if expanded {
+            String::from_utf8_lossy(bytes).into_owned()
+        } else {
+            tail_text(bytes, COLLAPSED_LIVE_TAIL_LINES)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {label}{}", if expanded { "" } else { " tail" }),
+            Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
+        )));
+        lines.extend(indented_wrapped_lines(
+            &content,
+            Style::default().fg(color),
+            width,
+        ));
+    }
+    lines
+}
+
+fn build_completed_bash_tail(content: &str, width: u16) -> Vec<Line<'static>> {
+    let (stdout, stderr) = content
+        .split_once("\n[stderr]\n")
+        .map_or((content, ""), |(stdout, stderr)| (stdout, stderr));
+    let mut lines = Vec::new();
+    for (label, stream, color) in [
+        ("stdout tail", stdout, COLOR_TEXT),
+        ("stderr tail", stderr, COLOR_ERROR),
+    ] {
+        if stream.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
+        )));
+        lines.extend(indented_wrapped_lines(
+            &tail_text(stream.as_bytes(), COLLAPSED_LIVE_TAIL_LINES),
+            Style::default().fg(color),
+            width,
+        ));
+    }
+    lines
+}
+
 fn push_folded_lines(
     lines: &mut Vec<Line<'static>>,
     mut block: Vec<Line<'static>>,
     expanded: bool,
     visible_lines: usize,
     kind: &str,
+    show_tail: bool,
 ) {
     if !expanded && block.len() > visible_lines {
         let hidden = block.len() - visible_lines;
-        lines.extend(block.drain(..visible_lines));
         lines.push(Line::from(Span::styled(
-            format!("  … {hidden} {kind} lines hidden · Ctrl+E expand"),
+            format!("  … {hidden} {kind} lines hidden · Ctrl+O expand"),
             Style::default().fg(COLOR_MUTED).add_modifier(Modifier::DIM),
         )));
+        if show_tail {
+            lines.extend(block.drain(hidden..));
+        } else {
+            lines.extend(block.drain(..visible_lines));
+        }
     } else {
         lines.append(&mut block);
     }
@@ -1220,7 +1453,7 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u1
     if !expanded && wrapped.len() > visible {
         lines.push(Line::from(Span::styled(
             format!(
-                "     … {} command lines hidden · Ctrl+E expand  #{}",
+                "     … {} command lines hidden · Ctrl+O expand  #{}",
                 wrapped.len() - visible,
                 call.call_id
             ),
@@ -1248,6 +1481,7 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u1
 
 fn build_transcript_lines(
     messages: &[CoreMessage],
+    local_entries: &[LocalTranscriptEntry],
     width: u16,
     details_expanded: bool,
 ) -> Vec<Line<'static>> {
@@ -1275,28 +1509,59 @@ fn build_transcript_lines(
             width,
         );
         if !message.content.is_empty() {
-            let content_lines =
-                indented_wrapped_lines(&message.content, Style::default().fg(content_color), width);
-            if message.role == "tool" {
-                push_folded_lines(
-                    &mut lines,
-                    content_lines,
-                    details_expanded,
-                    COLLAPSED_FILE_OUTPUT_LINES,
-                    if is_file_result {
-                        "file output"
-                    } else {
-                        "tool output"
-                    },
-                );
+            let is_bash_result =
+                message.role == "tool" && source_call.is_some_and(|call| call.name == "bash");
+            if is_bash_result && !details_expanded {
+                lines.extend(build_completed_bash_tail(&message.content, width));
             } else {
-                lines.extend(content_lines);
+                let content_lines = indented_wrapped_lines(
+                    &message.content,
+                    Style::default().fg(content_color),
+                    width,
+                );
+                if message.role == "tool" {
+                    push_folded_lines(
+                        &mut lines,
+                        content_lines,
+                        details_expanded,
+                        COLLAPSED_FILE_OUTPUT_LINES,
+                        if is_file_result {
+                            "file output"
+                        } else {
+                            "tool output"
+                        },
+                        !is_file_result,
+                    );
+                } else {
+                    lines.extend(content_lines);
+                }
             }
         }
         for call in &message.tool_calls {
             push_tool_call(&mut lines, call, width, details_expanded);
             tool_calls.insert(call.call_id.as_str(), call);
         }
+        lines.push(Line::default());
+    }
+    for entry in local_entries {
+        push_wrapped_line(
+            &mut lines,
+            "◇ BTW · local only",
+            Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+            width,
+        );
+        lines.extend(indented_wrapped_lines(
+            &format!("Q: {}", entry.question),
+            Style::default().fg(COLOR_USER),
+            width,
+        ));
+        lines.extend(indented_wrapped_lines(
+            &entry.answer,
+            Style::default().fg(COLOR_TEXT),
+            width,
+        ));
         lines.push(Line::default());
     }
     lines
@@ -1317,6 +1582,8 @@ struct App {
     transcript_revision: u64,
     transcript_details_expanded: bool,
     transcript_layout: Option<TranscriptLayoutCache>,
+    local_entries: Vec<LocalTranscriptEntry>,
+    live_tool: Option<LiveToolOutput>,
 }
 
 impl App {
@@ -1336,6 +1603,8 @@ impl App {
             transcript_revision: 0,
             transcript_details_expanded: false,
             transcript_layout: None,
+            local_entries: Vec::new(),
+            live_tool: None,
         }
     }
 
@@ -1355,6 +1624,49 @@ impl App {
         self.transcript_layout = None;
     }
 
+    fn push_local_entry(&mut self, entry: LocalTranscriptEntry) {
+        self.local_entries.push(entry);
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_layout = None;
+    }
+
+    fn start_live_tool(&mut self, call_id: String, label: String) {
+        self.live_tool = Some(LiveToolOutput::new(call_id, label));
+    }
+
+    fn append_live_progress(
+        &mut self,
+        call_id: &str,
+        progress: ToolProgress,
+    ) -> Result<(), AppError> {
+        let bytes = STANDARD.decode(progress.data)?;
+        if self
+            .live_tool
+            .as_ref()
+            .is_none_or(|live| live.call_id != call_id)
+        {
+            self.live_tool = Some(LiveToolOutput::new(call_id.to_owned(), "tool".to_owned()));
+        }
+        if let Some(live) = &mut self.live_tool {
+            live.append(progress.stream, &bytes);
+        }
+        Ok(())
+    }
+
+    fn finish_live_tool(&mut self, call_id: &str) {
+        if self
+            .live_tool
+            .as_ref()
+            .is_some_and(|live| live.call_id == call_id)
+        {
+            self.live_tool = None;
+        }
+    }
+
+    fn clear_live_tool(&mut self) {
+        self.live_tool = None;
+    }
+
     fn visible_transcript(&mut self, width: u16, height: u16) -> Text<'static> {
         let rebuild = self
             .transcript_layout
@@ -1366,26 +1678,42 @@ impl App {
                 width,
                 lines: build_transcript_lines(
                     &self.snapshot.messages,
+                    &self.local_entries,
                     width,
                     self.transcript_details_expanded,
                 ),
             });
         }
+        let live_lines = self
+            .live_tool
+            .as_ref()
+            .map(|live| build_live_tool_lines(live, width, self.transcript_details_expanded))
+            .unwrap_or_default();
         let lines = &self
             .transcript_layout
             .as_ref()
             .expect("transcript layout was initialized")
             .lines;
-        self.max_scroll = lines.len().saturating_sub(usize::from(height));
+        let total_lines = lines.len().saturating_add(live_lines.len());
+        self.max_scroll = total_lines.saturating_sub(usize::from(height));
         self.page_rows = usize::from(height.max(1));
         if self.follow_tail {
             self.scroll_offset = self.max_scroll;
         } else {
             self.scroll_offset = self.scroll_offset.min(self.max_scroll);
         }
-        let start = self.scroll_offset.min(lines.len());
-        let end = start.saturating_add(usize::from(height)).min(lines.len());
-        Text::from(lines[start..end].to_vec())
+        let start = self.scroll_offset.min(total_lines);
+        let end = start.saturating_add(usize::from(height)).min(total_lines);
+        let mut visible = Vec::with_capacity(end.saturating_sub(start));
+        if start < lines.len() {
+            visible.extend_from_slice(&lines[start..end.min(lines.len())]);
+        }
+        if end > lines.len() {
+            let live_start = start.saturating_sub(lines.len());
+            let live_end = end - lines.len();
+            visible.extend_from_slice(&live_lines[live_start..live_end]);
+        }
+        Text::from(visible)
     }
 
     fn scroll_up(&mut self, rows: usize) {
@@ -1451,7 +1779,14 @@ impl App {
 
 enum RuntimeAction {
     Submit(String),
-    Approval { call_id: String, approved: bool },
+    Btw {
+        question: String,
+        snapshot: CoreSnapshot,
+    },
+    Approval {
+        call_id: String,
+        approved: bool,
+    },
     Drive(CoreResponse),
 }
 
@@ -1459,6 +1794,17 @@ enum RuntimeUpdate {
     Progress {
         snapshot: CoreSnapshot,
         status: String,
+    },
+    ToolStarted {
+        call_id: String,
+        label: String,
+    },
+    ToolProgress {
+        call_id: String,
+        progress: ToolProgress,
+    },
+    ToolFinished {
+        call_id: String,
     },
     Settled(RuntimeFinal),
     Failed(String),
@@ -1468,6 +1814,7 @@ struct RuntimeFinal {
     snapshot: CoreSnapshot,
     status: String,
     approval: Option<CoreToolCall>,
+    local_entry: Option<LocalTranscriptEntry>,
 }
 
 enum KeyAction {
@@ -1475,6 +1822,7 @@ enum KeyAction {
     Quit,
     Cancel,
     Submit(String),
+    Btw(String),
     Approval { call_id: String, approved: bool },
 }
 
@@ -1482,6 +1830,8 @@ struct RuntimeResources {
     core: CoreClient,
     plugins: PluginManager,
     provider: ModelClient,
+    desired_safe_tools: Vec<String>,
+    desired_permission_mode: PermissionMode,
 }
 
 type SharedRuntime = Arc<Mutex<RuntimeResources>>;
@@ -1538,7 +1888,12 @@ async fn main() -> Result<(), AppError> {
     let mut app = App::new(initial.snapshot);
     let initial_action = match app.snapshot.phase.as_str() {
         "idle" => {
-            let configured = core.event(&CoreEvent::configure_tools(safe_tools)).await?;
+            let configured = core
+                .event(&CoreEvent::configure_tools(
+                    safe_tools.clone(),
+                    args.permission_mode,
+                ))
+                .await?;
             app.set_snapshot(configured.snapshot);
             args.prompt.clone().map(RuntimeAction::Submit)
         }
@@ -1598,6 +1953,8 @@ async fn main() -> Result<(), AppError> {
         core,
         plugins,
         provider,
+        desired_safe_tools: safe_tools,
+        desired_permission_mode: args.permission_mode,
     }));
     run_tui(&mut app, Arc::clone(&runtime), initial_action).await?;
     let mut runtime = runtime.lock().await;
@@ -1699,6 +2056,18 @@ async fn tui_loop(
                                     updates.clone(),
                                 ));
                             }
+                            KeyAction::Btw(question) if active.is_none() => {
+                                app.busy = true;
+                                app.status = "Asking BTW…".to_owned();
+                                active = Some(spawn_runtime_action(
+                                    Arc::clone(&runtime),
+                                    RuntimeAction::Btw {
+                                        question,
+                                        snapshot: app.snapshot.clone(),
+                                    },
+                                    updates.clone(),
+                                ));
+                            }
                             KeyAction::Approval { call_id, approved } if active.is_none() => {
                                 app.busy = true;
                                 app.approval = None;
@@ -1709,7 +2078,7 @@ async fn tui_loop(
                                     updates.clone(),
                                 ));
                             }
-                            KeyAction::Submit(_) | KeyAction::Approval { .. } => {}
+                            KeyAction::Submit(_) | KeyAction::Btw(_) | KeyAction::Approval { .. } => {}
                         }
                     }
                     CrosstermEvent::Mouse(mouse) => {
@@ -1731,14 +2100,39 @@ async fn tui_loop(
                         app.busy = true;
                         dirty = true;
                     }
+                    Some(RuntimeUpdate::ToolStarted { call_id, label }) => {
+                        app.start_live_tool(call_id, label.clone());
+                        app.status = format!("Running {label}…");
+                        app.busy = true;
+                        dirty = true;
+                    }
+                    Some(RuntimeUpdate::ToolProgress { call_id, progress }) => {
+                        app.append_live_progress(&call_id, progress)?;
+                        app.busy = true;
+                        dirty = true;
+                    }
+                    Some(RuntimeUpdate::ToolFinished { call_id }) => {
+                        app.finish_live_tool(&call_id);
+                        dirty = true;
+                    }
                     Some(RuntimeUpdate::Settled(final_state)) => {
                         if let Some(active) = active.take() {
                             let _ = active.handle.await;
                         }
-                        app.set_snapshot(final_state.snapshot);
-                        app.status = final_state.status;
-                        app.approval = final_state.approval;
+                        let RuntimeFinal {
+                            snapshot,
+                            status,
+                            approval,
+                            local_entry,
+                        } = final_state;
+                        app.set_snapshot(snapshot);
+                        if let Some(entry) = local_entry {
+                            app.push_local_entry(entry);
+                        }
+                        app.status = status;
+                        app.approval = approval;
                         app.busy = false;
+                        app.clear_live_tool();
                         dirty = true;
                     }
                     Some(RuntimeUpdate::Failed(error)) => {
@@ -1747,6 +2141,7 @@ async fn tui_loop(
                         }
                         app.status = format!("Error: {error}");
                         app.busy = false;
+                        app.clear_live_tool();
                         dirty = true;
                     }
                     None => return Ok(()),
@@ -1768,7 +2163,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return KeyAction::Quit;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('e')) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o')) {
         app.toggle_transcript_details();
         return KeyAction::None;
     }
@@ -1822,8 +2217,28 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
         };
     }
     match key.code {
-        KeyCode::Enter if !app.busy && !app.input.trim().is_empty() => {
-            KeyAction::Submit(std::mem::take(&mut app.input))
+        KeyCode::Enter if !app.input.trim().is_empty() => {
+            let parsed = parse_submission(app.input.clone());
+            match parsed {
+                Ok(UserSubmission::Command(SlashCommand::Exit)) => {
+                    app.input.clear();
+                    KeyAction::Quit
+                }
+                Ok(_) | Err(_) if app.busy => KeyAction::None,
+                Ok(UserSubmission::Prompt(prompt)) => {
+                    app.input.clear();
+                    KeyAction::Submit(prompt)
+                }
+                Ok(UserSubmission::Command(SlashCommand::Btw(question))) => {
+                    app.input.clear();
+                    KeyAction::Btw(question)
+                }
+                Err(error) => {
+                    app.input.clear();
+                    app.status = format!("Error: {error}");
+                    KeyAction::None
+                }
+            }
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -1868,17 +2283,41 @@ async fn run_runtime_action(
     cancel: &CancellationToken,
 ) -> Result<RuntimeFinal, AppError> {
     let mut runtime = runtime.lock().await;
-    let response = match action {
-        RuntimeAction::Submit(text) => runtime.core.event(&CoreEvent::submit(text)).await?,
+    match action {
+        RuntimeAction::Btw { question, snapshot } => {
+            let answer = tokio::select! {
+                () = cancel.cancelled() => {
+                    return Ok(RuntimeFinal {
+                        snapshot,
+                        status: "BTW cancelled".to_owned(),
+                        approval: None,
+                        local_entry: None,
+                    });
+                }
+                result = runtime.provider.complete_text_only(&snapshot, &question) => result?,
+            };
+            Ok(RuntimeFinal {
+                snapshot,
+                status: "Ready".to_owned(),
+                approval: None,
+                local_entry: Some(LocalTranscriptEntry { question, answer }),
+            })
+        }
+        RuntimeAction::Submit(text) => {
+            let response = runtime.core.event(&CoreEvent::submit(text)).await?;
+            drive_response(response, &mut runtime, updates, cancel).await
+        }
         RuntimeAction::Approval { call_id, approved } => {
-            runtime
+            let response = runtime
                 .core
                 .event(&CoreEvent::approval(call_id, approved))
-                .await?
+                .await?;
+            drive_response(response, &mut runtime, updates, cancel).await
         }
-        RuntimeAction::Drive(response) => response,
-    };
-    drive_response(response, &mut runtime, updates, cancel).await
+        RuntimeAction::Drive(response) => {
+            drive_response(response, &mut runtime, updates, cancel).await
+        }
+    }
 }
 
 async fn drive_response(
@@ -1919,20 +2358,31 @@ async fn drive_response(
                     snapshot,
                     status: format!("Approve {}? [y]es / [n]o", call.display_label()),
                     approval: Some(call),
+                    local_entry: None,
                 });
             }
             "invoke_tool" => {
                 let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
                     kind: "invoke_tool".to_owned(),
                 })?;
+                let _ = updates.send(RuntimeUpdate::ToolStarted {
+                    call_id: call.call_id.clone(),
+                    label: call.display_label().to_owned(),
+                });
                 send_runtime_progress(
                     updates,
                     &snapshot,
                     &format!("Running {}…", call.display_label()),
                 );
+                let progress_call_id = call.call_id.clone();
                 let tool_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = runtime.plugins.call(&call) => Some(result),
+                    result = runtime.plugins.call(&call, |progress| {
+                        let _ = updates.send(RuntimeUpdate::ToolProgress {
+                            call_id: progress_call_id.clone(),
+                            progress,
+                        });
+                    }) => Some(result),
                 };
                 let Some(tool_result) = tool_result else {
                     return cancel_runtime(runtime).await;
@@ -1941,6 +2391,9 @@ async fn drive_response(
                     Ok(result) => (result.output, false),
                     Err(error) => (format!("Plugin execution failed: {error}"), true),
                 };
+                let _ = updates.send(RuntimeUpdate::ToolFinished {
+                    call_id: call.call_id.clone(),
+                });
                 let next = runtime
                     .core
                     .event(&CoreEvent::tool_completed(call.call_id, content, is_error))
@@ -1951,21 +2404,44 @@ async fn drive_response(
             _ => return Err(AppError::UnknownCoreEffect { kind: effect.kind }),
         }
     }
+    apply_desired_permissions(runtime, &mut snapshot).await?;
     Ok(RuntimeFinal {
         snapshot,
         status: "Ready".to_owned(),
         approval: None,
+        local_entry: None,
     })
 }
 
 async fn cancel_runtime(runtime: &mut RuntimeResources) -> Result<RuntimeFinal, AppError> {
     runtime.plugins.retire().await;
     let response = runtime.core.event(&CoreEvent::abort()).await?;
+    let mut snapshot = response.snapshot;
+    apply_desired_permissions(runtime, &mut snapshot).await?;
     Ok(RuntimeFinal {
-        snapshot: response.snapshot,
+        snapshot,
         status: "Cancelled".to_owned(),
         approval: None,
+        local_entry: None,
     })
+}
+
+async fn apply_desired_permissions(
+    runtime: &mut RuntimeResources,
+    snapshot: &mut CoreSnapshot,
+) -> Result<(), AppError> {
+    let desired = runtime.desired_permission_mode.wire_value();
+    if snapshot.phase == "idle" && snapshot.permission_mode != desired {
+        let configured = runtime
+            .core
+            .event(&CoreEvent::configure_tools(
+                runtime.desired_safe_tools.clone(),
+                runtime.desired_permission_mode,
+            ))
+            .await?;
+        *snapshot = configured.snapshot;
+    }
+    Ok(())
 }
 
 fn send_runtime_progress(
@@ -2081,9 +2557,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         format!(" · view {}/{}", app.scroll_offset, app.max_scroll)
     };
     let details = if app.transcript_details_expanded {
-        " · Ctrl+E collapse details"
+        " · Ctrl+O collapse details"
     } else {
-        " · Ctrl+E expand details"
+        " · Ctrl+O expand details"
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -2095,9 +2571,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · pending {} · safe {}{scroll}{details}",
+                    " · pending {} · safe {} · permission {}{scroll}{details}",
                     app.snapshot.pending_calls.len(),
-                    app.snapshot.safe_tools.len()
+                    app.snapshot.safe_tools.len(),
+                    app.snapshot.permission_mode
                 ),
                 Style::default().fg(COLOR_MUTED),
             ),
@@ -2127,9 +2604,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
-        App, COLOR_ACCENT, COLOR_MUTED, CoreMessage, CoreSnapshot, CoreToolCall, ToolSpec,
-        TranscriptLayoutCache, anthropic_messages, automatically_safe_tool_names,
-        build_transcript_lines, draw, handle_key, parse_openai_tool_calls,
+        App, COLOR_ACCENT, COLOR_MUTED, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall,
+        KeyAction, LiveToolOutput, LocalTranscriptEntry, PermissionMode, SlashCommand,
+        SlashCommandError, ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission,
+        anthropic_messages, automatically_safe_tool_names, build_live_tool_lines,
+        build_transcript_lines, draw, handle_key, parse_openai_tool_calls, parse_submission,
     };
 
     #[test]
@@ -2159,6 +2638,95 @@ mod tests {
             automatically_safe_tool_names(&tools),
             vec!["read".to_owned(), "grep".to_owned()]
         );
+    }
+
+    #[test]
+    fn parses_supported_slash_commands_and_literal_escape() {
+        assert_eq!(
+            parse_submission("/btw why this design?".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Btw(
+                "why this design?".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse_submission("/exit".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Exit))
+        );
+        assert_eq!(
+            parse_submission("//btw literal".to_owned()),
+            Ok(UserSubmission::Prompt("/btw literal".to_owned()))
+        );
+        assert_eq!(
+            parse_submission("/btw".to_owned()),
+            Err(SlashCommandError::MissingBtwQuestion)
+        );
+        assert_eq!(
+            parse_submission("/unknown".to_owned()),
+            Err(SlashCommandError::Unknown("unknown".to_owned()))
+        );
+    }
+
+    #[test]
+    fn enter_dispatches_btw_and_exit_locally() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.input = "/btw side question".to_owned();
+        match handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app) {
+            KeyAction::Btw(question) => assert_eq!(question, "side question"),
+            _ => panic!("/btw must dispatch as a local BTW action"),
+        }
+        assert!(app.input.is_empty());
+
+        app.busy = true;
+        app.input = "/exit".to_owned();
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            KeyAction::Quit
+        ));
+    }
+
+    #[test]
+    fn local_btw_entry_invalidates_layout_without_mutating_snapshot() {
+        let snapshot = CoreSnapshot {
+            messages: vec![CoreMessage {
+                role: "user".to_owned(),
+                content: "main task".to_owned(),
+                ..CoreMessage::default()
+            }],
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot.clone());
+        app.transcript_layout = Some(TranscriptLayoutCache {
+            revision: app.transcript_revision,
+            width: 80,
+            lines: vec![Line::default()],
+        });
+        let revision = app.transcript_revision;
+        app.push_local_entry(LocalTranscriptEntry {
+            question: "side question".to_owned(),
+            answer: "side answer".to_owned(),
+        });
+        assert_eq!(app.snapshot.messages, snapshot.messages);
+        assert_eq!(app.snapshot.pending_calls, snapshot.pending_calls);
+        assert_eq!(app.snapshot.phase, snapshot.phase);
+        assert_eq!(app.transcript_revision, revision.wrapping_add(1));
+        assert!(app.transcript_layout.is_none());
+        let rendered = app
+            .visible_transcript(80, 20)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("◇ BTW · local only"));
+        assert!(rendered.contains("Q: side question"));
+        assert!(rendered.contains("side answer"));
+    }
+
+    #[test]
+    fn encodes_auto_permission_for_the_lean_core() {
+        let event = CoreEvent::configure_tools(vec!["read".to_owned()], PermissionMode::Auto);
+        let encoded = serde_json::to_value(event).expect("event must serialize");
+        assert_eq!(encoded["permissionMode"], "auto");
     }
 
     #[test]
@@ -2207,6 +2775,7 @@ mod tests {
                     ..CoreMessage::default()
                 },
             ],
+            &[],
             80,
             true,
         );
@@ -2232,8 +2801,8 @@ mod tests {
             }],
             ..CoreMessage::default()
         }];
-        let collapsed = build_transcript_lines(&messages, 32, false);
-        let expanded = build_transcript_lines(&messages, 32, true);
+        let collapsed = build_transcript_lines(&messages, &[], 32, false);
+        let expanded = build_transcript_lines(&messages, &[], 32, true);
         assert!(
             collapsed
                 .iter()
@@ -2269,8 +2838,8 @@ mod tests {
                 ..CoreMessage::default()
             },
         ];
-        let collapsed = build_transcript_lines(&messages, 80, false);
-        let expanded = build_transcript_lines(&messages, 80, true);
+        let collapsed = build_transcript_lines(&messages, &[], 80, false);
+        let expanded = build_transcript_lines(&messages, &[], 80, true);
         assert!(
             collapsed
                 .iter()
@@ -2290,7 +2859,81 @@ mod tests {
     }
 
     #[test]
-    fn control_e_toggles_transcript_details_and_invalidates_layout() {
+    fn folded_command_results_show_latest_tail() {
+        let messages = [
+            CoreMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![CoreToolCall {
+                    call_id: "call_bash".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: serde_json::json!({"command": "long command"}),
+                }],
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("call_bash".to_owned()),
+                content: format!(
+                    "{}\n[stderr]\n{}",
+                    (0..8)
+                        .map(|index| format!("stdout line {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    (0..8)
+                        .map(|index| format!("stderr line {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+                ..CoreMessage::default()
+            },
+        ];
+        let collapsed = build_transcript_lines(&messages, &[], 80, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed.contains("stdout tail"));
+        assert!(collapsed.contains("stderr tail"));
+        assert!(collapsed.contains("stdout line 7"));
+        assert!(collapsed.contains("stderr line 7"));
+        assert!(!collapsed.contains("stdout line 0"));
+        assert!(!collapsed.contains("stderr line 0"));
+    }
+
+    #[test]
+    fn live_command_collapsed_view_shows_latest_stdout_and_stderr() {
+        let mut live = LiveToolOutput::new("call_live".to_owned(), "bash".to_owned());
+        live.append(
+            ToolOutputStream::Stdout,
+            b"stdout one\nstdout two\nstdout three\nstdout four\nstdout five\n",
+        );
+        live.append(
+            ToolOutputStream::Stderr,
+            b"stderr one\nstderr two\nstderr three\nstderr four\nstderr five\n",
+        );
+        let collapsed = build_live_tool_lines(&live, 80, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed.contains("stdout tail"));
+        assert!(collapsed.contains("stderr tail"));
+        assert!(!collapsed.contains("stdout one"));
+        assert!(collapsed.contains("stdout five"));
+        assert!(!collapsed.contains("stderr one"));
+        assert!(collapsed.contains("stderr five"));
+
+        let expanded = build_live_tool_lines(&live, 80, true)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded.contains("stdout one"));
+        assert!(expanded.contains("stderr one"));
+    }
+
+    #[test]
+    fn control_o_toggles_transcript_details_and_invalidates_layout() {
         let mut app = App::new(CoreSnapshot::default());
         app.transcript_layout = Some(TranscriptLayoutCache {
             revision: app.transcript_revision,
@@ -2298,7 +2941,7 @@ mod tests {
             lines: vec![Line::default()],
         });
         let _ = handle_key(
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &mut app,
         );
         assert!(app.transcript_details_expanded);

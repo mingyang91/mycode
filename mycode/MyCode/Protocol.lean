@@ -39,6 +39,7 @@ public structure State where
   pendingCalls : Array ToolCall := #[]
   currentCall : Nat := 0
   safeTools : Array String := #[]
+  permissionMode : String := "ask"
   deriving Inhabited, ToJson, FromJson
 
 public structure Event where
@@ -50,6 +51,7 @@ public structure Event where
   content? : Option String := none
   isError? : Option Bool := none
   safeTools : Array String := #[]
+  permissionMode : String := "ask"
   deriving Inhabited, ToJson, FromJson
 
 public structure Effect where
@@ -63,6 +65,7 @@ public structure Snapshot where
   pendingCalls : Array ToolCall
   currentCall : Nat
   safeTools : Array String
+  permissionMode : String
   deriving Inhabited, ToJson, FromJson
 
 public def State.snapshot (state : State) : Snapshot := {
@@ -71,7 +74,17 @@ public def State.snapshot (state : State) : Snapshot := {
   pendingCalls := state.pendingCalls
   currentCall := state.currentCall
   safeTools := state.safeTools
+  permissionMode := state.permissionMode
 }
+
+public def State.fromJsonWithDefaults (json : Json) : Except String State :=
+  let migrated := match json with
+    | .obj _ =>
+      match json.getObjVal? "permissionMode" with
+      | .ok _ => json
+      | .error _ => json.setObjVal! "permissionMode" (toJson "ask")
+    | _ => json
+  fromJson? migrated
 
 public structure Request where
   version : Nat

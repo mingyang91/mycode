@@ -127,6 +127,79 @@ private def testQuotedCommitMessageParses : IO Unit := do
   | some (.commit message) => assert (message == "verified commit") "quoted commit message must be preserved"
   | _ => throw (IO.userError "quoted Git commit must parse")
 
+
+private def testAutoPermissionAllowsSimpleReads : IO Unit := do
+  let (configured, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read", "git_read"]
+    permissionMode := "auto"
+  }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Inspect files" }
+  let (pwdState, pwdEffects) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-auto-pwd" "pwd"]
+  }
+  assert (pwdState.phase.label == "waiting_tool") "auto mode must allow pwd"
+  assert (pwdEffects[0]!.kind == "invoke_tool") "auto pwd must invoke directly"
+  let (submittedAgain, _) ← step configured { kind := "submit", text? := some "List files" }
+  let (lsState, _) ← step submittedAgain {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-auto-ls" "ls -la ."]
+  }
+  assert (lsState.phase.label == "waiting_tool") "auto mode must allow ls in cwd"
+
+private def testAutoPermissionRejectsUnsafeReads : IO Unit := do
+  let (configured, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read", "git_read"]
+    permissionMode := "auto"
+  }
+  for command in ["cat src/Main.lean", "cat /etc/passwd", "cat ../secret", "cat file; rm file", "ls -L ."] do
+    let (submitted, _) ← step configured { kind := "submit", text? := some "Unsafe read" }
+    let (next, effects) ← step submitted {
+      kind := "model_completed"
+      toolCalls := #[bashCall "call-auto-reject" command]
+    }
+    assert (next.phase.label == "waiting_approval") s!"auto mode must prompt for {command}"
+    assert (effects[0]!.kind == "request_approval") "unsafe auto command must request approval"
+
+private def testPermissionModesFailClosedAndYolo : IO Unit := do
+  let (askState, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read"]
+    permissionMode := "unknown"
+  }
+  let (askSubmitted, _) ← step askState { kind := "submit", text? := some "Run pwd" }
+  let (askNext, _) ← step askSubmitted {
+    kind := "model_completed"
+    toolCalls := #[bashCall "call-ask" "pwd"]
+  }
+  assert (askNext.phase.label == "waiting_approval") "unknown permission mode must fail closed"
+
+  let (yoloState, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read"]
+    permissionMode := "yolo"
+  }
+  let (yoloSubmitted, _) ← step yoloState { kind := "submit", text? := some "Write" }
+  let (yoloNext, yoloEffects) ← step yoloSubmitted {
+    kind := "model_completed"
+    toolCalls := #[call "call-yolo" "write"]
+  }
+  assert (yoloNext.phase.label == "waiting_tool") "yolo mode must allow write"
+  assert (yoloEffects[0]!.kind == "invoke_tool") "yolo write must invoke directly"
+
+private def testLegacySessionDefaultsToAsk : IO Unit := do
+  let legacy := Json.mkObj [
+    ("phase", toJson Phase.idle),
+    ("messages", toJson (#[] : Array ChatMessage)),
+    ("pendingCalls", toJson (#[] : Array ToolCall)),
+    ("currentCall", toJson (0 : Nat)),
+    ("safeTools", toJson (#[] : Array String))
+  ]
+  match State.fromJsonWithDefaults legacy with
+  | .ok state => assert (state.permissionMode == "ask") "legacy session must default to ask"
+  | .error error => throw (IO.userError s!"legacy session failed to decode: {error}")
 def main : IO Unit := do
   testSafeToolFlowsDirectlyToExecutor
   testUnsafeToolNeedsApproval
@@ -137,4 +210,8 @@ def main : IO Unit := do
   testCompoundGitFallsBackToBash
   testGitStaysInBashWithoutCapability
   testQuotedCommitMessageParses
+  testAutoPermissionAllowsSimpleReads
+  testAutoPermissionRejectsUnsafeReads
+  testPermissionModesFailClosedAndYolo
+  testLegacySessionDefaultsToAsk
   IO.println "MyCode core tests passed"

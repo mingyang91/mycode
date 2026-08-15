@@ -148,6 +148,26 @@ private def commandArgument? (arguments : Json) : Option String :=
   | .ok (.str command) => some command
   | _ => none
 
+private def isAutoLsArgument (value : String) : Bool :=
+  value == "." ||
+    (value.startsWith "-" && !value.contains "/" && !value.contains ".." &&
+      !value.contains "H" && !value.contains "L" && !value.contains "dereference")
+
+private def autoReadCommandWords : List String → Bool
+  | ["pwd"] => true
+  | "ls" :: args => args.all isAutoLsArgument
+  | _ => false
+
+public def ToolCall.autoPermissionAllowed (call : ToolCall) : Bool :=
+  if call.name != "bash" then false
+  else
+    match commandArgument? call.arguments with
+    | none => false
+    | some command =>
+      match tokenizeShellCommand command with
+      | .ok words => autoReadCommandWords words.toList
+      | .error _ => false
+
 public def lowerGitToolCall? (call : ToolCall) : Option ToolCall := do
   if call.name != "bash" then none else pure ()
   let command ← commandArgument? call.arguments

@@ -10,18 +10,20 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ignore::WalkBuilder;
 use mycode_plugin_protocol::{
     CallToolParams, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_TOOL_OUTPUT_BYTES, EmptyParams,
-    InitializeResult, PluginErrorCode, PluginIdentity, ProtocolRange, RequestEnvelope,
-    RequestOperation, ResponseEnvelope, ToolListResult, ToolResult, ToolSpec, read_request,
-    tool_failure, write_response,
+    InitializeResult, PluginErrorCode, PluginIdentity, ProgressEnvelope, ProtocolError,
+    ProtocolRange, RequestEnvelope, RequestOperation, ResponseEnvelope, ToolListResult,
+    ToolOutputStream, ToolProgress, ToolResult, ToolSpec, read_request, tool_failure,
+    write_progress, write_response,
 };
 use regex::RegexBuilder;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, stdin, stdout},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, stdin, stdout},
     process::Command,
     time::timeout,
 };
@@ -77,6 +79,8 @@ enum WorkspaceError {
     SearchTask(#[from] tokio::task::JoinError),
     #[error("filesystem or process operation failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("failed to publish tool progress: {0}")]
+    ProgressProtocol(#[from] ProtocolError),
 }
 
 #[tokio::main]
@@ -95,7 +99,8 @@ async fn main() -> Result<(), WorkspaceError> {
             }
         };
         let was_initialize = matches!(&request.operation, RequestOperation::Initialize(_));
-        let (response, shutdown) = handle_request(request, &workspace, initialized).await;
+        let (response, shutdown) =
+            handle_request(request, &workspace, initialized, &mut output).await;
         if was_initialize && response.ok {
             initialized = true;
         }
@@ -109,11 +114,15 @@ async fn main() -> Result<(), WorkspaceError> {
     }
 }
 
-async fn handle_request(
+async fn handle_request<W>(
     request: RequestEnvelope,
     workspace: &Path,
     initialized: bool,
-) -> (ResponseEnvelope, bool) {
+    output: &mut W,
+) -> (ResponseEnvelope, bool)
+where
+    W: AsyncWrite + Unpin,
+{
     let request_id = request.id.clone();
     match request.operation {
         RequestOperation::Initialize(_) if !initialized => success(
@@ -143,7 +152,7 @@ async fn handle_request(
             "initialize must complete before tool discovery",
         ),
         RequestOperation::CallTool(call) if initialized => {
-            match execute_tool(workspace, call).await {
+            match execute_tool(workspace, call, &request_id, output).await {
                 Ok(result) => success(request_id, &result),
                 Err(error) => failure(request_id, PluginErrorCode::ToolFailed, error.to_string()),
             }
@@ -256,23 +265,27 @@ fn tools() -> Vec<ToolSpec> {
     ]
 }
 
-async fn execute_tool(
+async fn execute_tool<W>(
     workspace: &Path,
     call: CallToolParams,
-) -> Result<ToolResult, WorkspaceError> {
+    request_id: &str,
+    output: &mut W,
+) -> Result<ToolResult, WorkspaceError>
+where
+    W: AsyncWrite + Unpin,
+{
     if call.name == "grep" {
         return grep_files(workspace, &call.arguments).await;
     }
-    let output = match call.name.as_str() {
+    let output_text = match call.name.as_str() {
         "read" => read_file(workspace, &call.arguments).await?,
         "write" => write_file(workspace, &call.arguments).await?,
         "edit" => edit_file(workspace, &call.arguments).await?,
-        "bash" => run_bash(workspace, &call.arguments).await?,
+        "bash" => run_bash(workspace, &call.arguments, request_id, output).await?,
         _ => return Err(WorkspaceError::UnknownTool),
     };
-    bounded_output(output)
+    bounded_output(output_text)
 }
-
 async fn read_file(workspace: &Path, arguments: &Value) -> Result<String, WorkspaceError> {
     let path = existing_path(workspace, required_string(arguments, "path")?).await?;
     let file = tokio::fs::File::open(path).await?;
@@ -438,7 +451,15 @@ async fn atomic_replace(path: &Path, content: &[u8]) -> Result<(), WorkspaceErro
     }
     result
 }
-async fn run_bash(workspace: &Path, arguments: &Value) -> Result<String, WorkspaceError> {
+async fn run_bash<W>(
+    workspace: &Path,
+    arguments: &Value,
+    request_id: &str,
+    progress_output: &mut W,
+) -> Result<String, WorkspaceError>
+where
+    W: AsyncWrite + Unpin,
+{
     let command = required_string(arguments, "command")?;
     let timeout_ms = optional_timeout(arguments)?;
     let mut child = Command::new("/bin/sh")
@@ -450,21 +471,45 @@ async fn run_bash(workspace: &Path, arguments: &Value) -> Result<String, Workspa
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let stdout = child
+    let mut stdout = child
         .stdout
         .take()
         .ok_or(WorkspaceError::MissingChildPipe)?;
-    let stderr = child
+    let mut stderr = child
         .stderr
         .take()
         .ok_or(WorkspaceError::MissingChildPipe)?;
     let completed = timeout(Duration::from_millis(timeout_ms), async {
-        let (stdout, stderr, status) = tokio::try_join!(
-            read_bounded(stdout, DEFAULT_MAX_TOOL_OUTPUT_BYTES),
-            read_bounded(stderr, DEFAULT_MAX_TOOL_OUTPUT_BYTES),
-            async { child.wait().await.map_err(WorkspaceError::from) }
-        )?;
-        Ok::<_, WorkspaceError>((stdout, stderr, status))
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut stdout_chunk = [0_u8; 8192];
+        let mut stderr_chunk = [0_u8; 8192];
+        while stdout_open || stderr_open {
+            tokio::select! {
+                read = stdout.read(&mut stdout_chunk), if stdout_open => {
+                    let count = read?;
+                    if count == 0 {
+                        stdout_open = false;
+                    } else {
+                        append_bounded_output(&mut stdout_bytes, stderr_bytes.len(), &stdout_chunk[..count])?;
+                        emit_progress(progress_output, request_id, ToolOutputStream::Stdout, &stdout_chunk[..count]).await?;
+                    }
+                }
+                read = stderr.read(&mut stderr_chunk), if stderr_open => {
+                    let count = read?;
+                    if count == 0 {
+                        stderr_open = false;
+                    } else {
+                        append_bounded_output(&mut stderr_bytes, stdout_bytes.len(), &stderr_chunk[..count])?;
+                        emit_progress(progress_output, request_id, ToolOutputStream::Stderr, &stderr_chunk[..count]).await?;
+                    }
+                }
+            }
+        }
+        let status = child.wait().await?;
+        Ok::<_, WorkspaceError>((stdout_bytes, stderr_bytes, status))
     })
     .await;
     let (stdout, stderr, status) = match completed {
@@ -492,6 +537,43 @@ async fn run_bash(workspace: &Path, arguments: &Value) -> Result<String, Workspa
     Ok(text)
 }
 
+fn append_bounded_output(
+    destination: &mut Vec<u8>,
+    other_len: usize,
+    chunk: &[u8],
+) -> Result<(), WorkspaceError> {
+    if destination.len() + other_len + chunk.len() > DEFAULT_MAX_TOOL_OUTPUT_BYTES {
+        return Err(WorkspaceError::OutputTooLarge {
+            limit: DEFAULT_MAX_TOOL_OUTPUT_BYTES,
+        });
+    }
+    destination.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn emit_progress<W>(
+    output: &mut W,
+    request_id: &str,
+    stream: ToolOutputStream,
+    bytes: &[u8],
+) -> Result<(), WorkspaceError>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_progress(
+        output,
+        &ProgressEnvelope {
+            v: mycode_plugin_protocol::PROTOCOL_VERSION,
+            id: request_id.to_owned(),
+            progress: ToolProgress {
+                stream,
+                data: STANDARD.encode(bytes),
+            },
+        },
+    )
+    .await?;
+    Ok(())
+}
 async fn read_bounded<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, WorkspaceError>
 where
     R: AsyncRead + Unpin,
@@ -628,8 +710,14 @@ fn bounded_output(output: String) -> Result<ToolResult, WorkspaceError> {
 
 #[cfg(test)]
 mod tests {
+    use mycode_plugin_protocol::{
+        CallToolParams, InitializeParams, PluginMessage, RequestEnvelope, RequestOperation,
+        ToolOutputStream, read_plugin_message,
+    };
+    use serde_json::json;
     use std::{
         env, fs,
+        path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -648,15 +736,25 @@ mod tests {
         }
     }
 
+    async fn execute_test_tool(
+        workspace: &Path,
+        call: CallToolParams,
+    ) -> Result<mycode_plugin_protocol::ToolResult, WorkspaceError> {
+        let mut sink = tokio::io::sink();
+        execute_tool(workspace, call, "test_call", &mut sink).await
+    }
+
     #[tokio::test]
     async fn requires_initialization_before_tool_discovery() {
         let workspace = env::current_dir().expect("current directory must exist");
+        let mut sink = tokio::io::sink();
         let (response, shutdown) = handle_request(
             request(RequestOperation::ListTools(
                 mycode_plugin_protocol::EmptyParams {},
             )),
             &workspace,
             false,
+            &mut sink,
         )
         .await;
         assert!(!response.ok);
@@ -672,9 +770,52 @@ mod tests {
             })),
             &workspace,
             false,
+            &mut sink,
         )
         .await;
         assert!(initialized.ok);
+    }
+
+    #[tokio::test]
+    async fn streams_bash_stdout_and_stderr_before_terminal_result() {
+        let workspace = env::current_dir().expect("current directory must exist");
+        let (mut writer, mut reader) = tokio::io::duplex(65_536);
+        let result = execute_tool(
+            &workspace,
+            CallToolParams {
+                name: "bash".to_owned(),
+                arguments: json!({"command": "printf stdout; printf stderr >&2"}),
+            },
+            "call_stream",
+            &mut writer,
+        )
+        .await
+        .expect("bash command must complete");
+        let first =
+            read_plugin_message(&mut reader, mycode_plugin_protocol::DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .expect("first progress frame must decode");
+        let second =
+            read_plugin_message(&mut reader, mycode_plugin_protocol::DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .expect("second progress frame must decode");
+        let mut streams = [first, second]
+            .into_iter()
+            .map(|message| match message {
+                PluginMessage::Progress(progress) => progress.progress.stream,
+                PluginMessage::Response(_) => panic!("expected progress before terminal response"),
+            })
+            .collect::<Vec<_>>();
+        streams.sort_by_key(|stream| match stream {
+            ToolOutputStream::Stdout => 0,
+            ToolOutputStream::Stderr => 1,
+        });
+        assert_eq!(
+            streams,
+            vec![ToolOutputStream::Stdout, ToolOutputStream::Stderr]
+        );
+        assert!(result.output.contains("stdout"));
+        assert!(result.output.contains("stderr"));
     }
 
     #[tokio::test]
@@ -687,7 +828,7 @@ mod tests {
         fs::create_dir(&root).expect("temporary workspace must be created");
         fs::write(root.join("note.txt"), "safe content").expect("fixture must write");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
-        let result = execute_tool(
+        let result = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "read".to_owned(),
@@ -697,7 +838,7 @@ mod tests {
         .await
         .expect("workspace file must be readable");
         assert_eq!(result.output, "safe content");
-        let outside = execute_tool(
+        let outside = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "read".to_owned(),
@@ -723,7 +864,7 @@ mod tests {
         )
         .expect("fixture must write");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
-        let result = execute_tool(
+        let result = execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "read".to_owned(),
@@ -753,7 +894,7 @@ mod tests {
         fs::write(&outside, "outside").expect("outside fixture must write");
         symlink(&outside, root.join("link.txt")).expect("symlink fixture must be created");
         let workspace = root.canonicalize().expect("workspace must canonicalize");
-        execute_tool(
+        execute_test_tool(
             &workspace,
             CallToolParams {
                 name: "write".to_owned(),

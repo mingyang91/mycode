@@ -5,8 +5,13 @@ namespace MyCode
 private def currentTool? (state : State) : Option ToolCall :=
   state.pendingCalls[state.currentCall]?
 
+private def normalizedPermissionMode (mode : String) : String :=
+  if ["ask", "auto", "yolo"].contains mode then mode else "ask"
+
 private def isSafeTool (state : State) (call : ToolCall) : Bool :=
-  state.safeTools.any (fun name => name == call.name)
+  state.permissionMode == "yolo" ||
+    state.safeTools.any (fun name => name == call.name) ||
+    (state.permissionMode == "auto" && call.autoPermissionAllowed)
 
 private def appendMessage (state : State) (message : ChatMessage) : State :=
   { state with messages := state.messages.push message }
@@ -60,7 +65,10 @@ public def transition (state : State) (event : Event) : Except String (State × 
   match event.kind with
   | "configure_tools" =>
     match state.phase with
-    | .idle => pure ({ state with safeTools := event.safeTools }, #[])
+    | .idle => pure ({ state with
+        safeTools := event.safeTools
+        permissionMode := normalizedPermissionMode event.permissionMode
+      }, #[])
     | _ => throw "tool catalogue cannot change while the agent is running"
   | "submit" =>
     requireIdle state "submit a prompt"

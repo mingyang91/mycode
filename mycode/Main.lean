@@ -34,7 +34,7 @@ private def loadState (path? : Option System.FilePath) : IO State := do
     else
       let text ← IO.FS.readFile path
       let json ← IO.ofExcept (Json.parse text)
-      IO.ofExcept (fromJson? json)
+      IO.ofExcept (State.fromJsonWithDefaults json)
 
 private def saveState (path? : Option System.FilePath) (state : State) : IO Unit := do
   match path? with

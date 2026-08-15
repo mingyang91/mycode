@@ -1116,6 +1116,7 @@ dependencies = [
 name = "mycode-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "crossterm",
  "futures-util",
@@ -1136,6 +1137,7 @@ dependencies = [
 name = "mycode-workspace-plugin"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "ignore",
  "mycode-plugin-protocol",
  "regex",
