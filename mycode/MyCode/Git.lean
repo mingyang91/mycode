@@ -148,14 +148,22 @@ private def commandArgument? (arguments : Json) : Option String :=
   | .ok (.str command) => some command
   | _ => none
 
-private def isAutoLsArgument (value : String) : Bool :=
-  value == "." ||
-    (value.startsWith "-" && !value.contains "/" && !value.contains ".." &&
-      !value.contains "H" && !value.contains "L" && !value.contains "dereference")
+private def isAutoLsFlag : Char → Bool
+  | '1' | 'A' | 'a' | 'h' | 'l' => true
+  | _ => false
+
+private def isAutoLsOption (value : String) : Bool :=
+  match value.toList with
+  | '-' :: flag :: rest => isAutoLsFlag flag && rest.all isAutoLsFlag
+  | _ => false
+
+private def autoLsArguments : List String → Bool
+  | [] | ["."] => true
+  | option :: rest => isAutoLsOption option && autoLsArguments rest
 
 private def autoReadCommandWords : List String → Bool
   | ["pwd"] => true
-  | "ls" :: args => args.all isAutoLsArgument
+  | "ls" :: args => autoLsArguments args
   | _ => false
 
 public def ToolCall.autoPermissionAllowed (call : ToolCall) : Bool :=

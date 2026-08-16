@@ -163,6 +163,21 @@ private def testAutoPermissionRejectsUnsafeReads : IO Unit := do
     assert (next.phase.label == "waiting_approval") s!"auto mode must prompt for {command}"
     assert (effects[0]!.kind == "request_approval") "unsafe auto command must request approval"
 
+private def testAutoPermissionRejectsLsOperandsAndGlobs : IO Unit := do
+  let (configured, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read", "git_read"]
+    permissionMode := "auto"
+  }
+  for command in ["ls -- -private", "ls -*", "ls *", "ls -private"] do
+    let (submitted, _) ← step configured { kind := "submit", text? := some "Unsafe ls" }
+    let (next, effects) ← step submitted {
+      kind := "model_completed"
+      toolCalls := #[bashCall "call-auto-ls-reject" command]
+    }
+    assert (next.phase.label == "waiting_approval") s!"auto mode must prompt for {command}"
+    assert (effects[0]!.kind == "request_approval") "unsafe ls must request approval"
+
 private def testPermissionModesFailClosedAndYolo : IO Unit := do
   let (askState, _) ← step {} {
     kind := "configure_tools"
@@ -212,6 +227,7 @@ def main : IO Unit := do
   testQuotedCommitMessageParses
   testAutoPermissionAllowsSimpleReads
   testAutoPermissionRejectsUnsafeReads
+  testAutoPermissionRejectsLsOperandsAndGlobs
   testPermissionModesFailClosedAndYolo
   testLegacySessionDefaultsToAsk
   IO.println "MyCode core tests passed"
