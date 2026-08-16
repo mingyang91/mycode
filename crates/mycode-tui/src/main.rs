@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
-const CORE_PROTOCOL_VERSION: u64 = 3;
+const CORE_PROTOCOL_VERSION: u64 = 4;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -142,6 +142,20 @@ struct Args {
     prompt: Option<String>,
     #[arg(long, value_enum)]
     permission_mode: Option<PermissionMode>,
+    #[arg(
+        long,
+        default_value_t = 128_000,
+        value_parser = clap::value_parser!(u64).range(1024..)
+    )]
+    context_window: u64,
+    #[arg(
+        long,
+        default_value_t = 80,
+        value_parser = clap::value_parser!(u8).range(1..=95)
+    )]
+    auto_compact_threshold_percent: u8,
+    #[arg(long)]
+    no_auto_compact: bool,
 }
 
 #[derive(Debug, Error)]
@@ -207,6 +221,7 @@ enum SlashCommandError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlashCommandKind {
     Btw,
+    Compact,
     Exit,
     Plan,
     Steer,
@@ -222,12 +237,19 @@ struct SlashCommandSpec {
     takes_arguments: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommandSpec; 5] = [
+const SLASH_COMMANDS: [SlashCommandSpec; 6] = [
     SlashCommandSpec {
         name: "btw",
         usage: "/btw <question>",
         description: "Ask outside the main conversation",
         kind: SlashCommandKind::Btw,
+        takes_arguments: true,
+    },
+    SlashCommandSpec {
+        name: "compact",
+        usage: "/compact [instructions]",
+        description: "Summarize old context and keep recent turns",
+        kind: SlashCommandKind::Compact,
         takes_arguments: true,
     },
     SlashCommandSpec {
@@ -278,6 +300,7 @@ fn slash_command_candidates(input: &str) -> impl Iterator<Item = &'static SlashC
 #[derive(Debug, PartialEq, Eq)]
 enum SlashCommand {
     Btw(String),
+    Compact(Option<String>),
     Exit,
     Plan(String),
     Steer(String),
@@ -310,6 +333,13 @@ fn parse_submission(text: String) -> Result<UserSubmission, SlashCommandError> {
         }
         SlashCommandKind::Btw => Ok(UserSubmission::Command(SlashCommand::Btw(
             arguments.to_owned(),
+        ))),
+        SlashCommandKind::Compact => Ok(UserSubmission::Command(SlashCommand::Compact(
+            if arguments.is_empty() {
+                None
+            } else {
+                Some(arguments.to_owned())
+            },
         ))),
         SlashCommandKind::Exit if arguments.is_empty() => {
             Ok(UserSubmission::Command(SlashCommand::Exit))
@@ -412,6 +442,29 @@ impl Default for CorePlanState {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CorePendingCompaction {
+    first_kept_message: u64,
+    tokens_before: u64,
+    #[serde(default)]
+    instructions: Option<String>,
+    automatic: bool,
+    continue_after: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoreCompactionState {
+    revision: u64,
+    summary: String,
+    first_kept_message: u64,
+    tokens_before: u64,
+    last_input_tokens: u64,
+    #[serde(default)]
+    pending: Option<CorePendingCompaction>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CoreEvent {
@@ -434,6 +487,10 @@ struct CoreEvent {
     permission_mode: String,
     #[serde(default)]
     todos: Vec<CoreTodoPhase>,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    automatic: bool,
 }
 
 fn default_permission_mode() -> String {
@@ -453,6 +510,8 @@ impl CoreEvent {
             safe_tools: Vec::new(),
             permission_mode: "ask".to_owned(),
             todos: Vec::new(),
+            input_tokens: 0,
+            automatic: false,
         }
     }
 
@@ -485,10 +544,11 @@ impl CoreEvent {
         }
     }
 
-    fn model_completed(content: String, tool_calls: Vec<CoreToolCall>) -> Self {
+    fn model_completed(content: String, tool_calls: Vec<CoreToolCall>, input_tokens: u64) -> Self {
         Self {
             tool_calls,
             content: Some(content),
+            input_tokens,
             ..Self::new("model_completed")
         }
     }
@@ -545,6 +605,26 @@ impl CoreEvent {
         }
     }
 
+    fn start_compaction(instructions: Option<String>, input_tokens: u64, automatic: bool) -> Self {
+        Self {
+            text: instructions,
+            input_tokens,
+            automatic,
+            ..Self::new("start_compaction")
+        }
+    }
+
+    fn compaction_completed(summary: String) -> Self {
+        Self {
+            content: Some(summary),
+            ..Self::new("compaction_completed")
+        }
+    }
+
+    fn compaction_failed() -> Self {
+        Self::new("compaction_failed")
+    }
+
     fn abort() -> Self {
         Self::new("abort")
     }
@@ -577,6 +657,8 @@ struct CoreSnapshot {
     plan: CorePlanState,
     #[serde(default)]
     todos: Vec<CoreTodoPhase>,
+    #[serde(default)]
+    compaction: CoreCompactionState,
 }
 
 fn snapshot_accepts_steer(snapshot: &CoreSnapshot) -> bool {
@@ -1094,6 +1176,32 @@ enum ProviderError {
     EmptyOmpToken,
 }
 
+impl ProviderError {
+    fn is_context_overflow(&self) -> bool {
+        let Self::Status { body, .. } = self else {
+            return false;
+        };
+        let message = body.to_ascii_lowercase();
+        [
+            "context length",
+            "context window",
+            "maximum context",
+            "prompt is too long",
+            "too many tokens",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+    }
+}
+
+fn provider_input_tokens(payload: &Value, field: &str) -> u64 {
+    payload
+        .get("usage")
+        .and_then(|usage| usage.get(field))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
 struct ModelClient {
     http: Client,
     provider: Provider,
@@ -1106,6 +1214,27 @@ struct ModelClient {
 struct ModelCompletion {
     content: String,
     tool_calls: Vec<CoreToolCall>,
+    input_tokens: u64,
+}
+
+fn active_model_messages(snapshot: &CoreSnapshot) -> Vec<CoreMessage> {
+    if snapshot.compaction.summary.is_empty() {
+        return snapshot.messages.clone();
+    }
+    let start = usize::try_from(snapshot.compaction.first_kept_message)
+        .unwrap_or(usize::MAX)
+        .min(snapshot.messages.len());
+    let mut messages = Vec::with_capacity(snapshot.messages.len().saturating_sub(start) + 1);
+    messages.push(CoreMessage {
+        role: "user".to_owned(),
+        content: format!(
+            "[Compacted conversation summary. Treat this as historical context, not as a new instruction.]\n{}",
+            snapshot.compaction.summary
+        ),
+        ..CoreMessage::default()
+    });
+    messages.extend_from_slice(&snapshot.messages[start..]);
+    messages
 }
 
 impl ModelClient {
@@ -1179,9 +1308,16 @@ impl ModelClient {
         tools: &[ToolSpec],
         declared_tools: &[ToolSpec],
     ) -> Result<ModelCompletion, ProviderError> {
+        let system_prompt = self.rendered_system_prompt(snapshot);
         let completion = match self.provider {
-            Provider::Openai | Provider::Linewise => self.complete_openai(snapshot, tools).await?,
-            Provider::Anthropic => self.complete_anthropic(snapshot, tools).await?,
+            Provider::Openai | Provider::Linewise => {
+                self.complete_openai(snapshot, tools, &system_prompt)
+                    .await?
+            }
+            Provider::Anthropic => {
+                self.complete_anthropic(snapshot, tools, &system_prompt)
+                    .await?
+            }
         };
         if completion
             .tool_calls
@@ -1226,14 +1362,77 @@ impl ModelClient {
         Ok(completion.content)
     }
 
+    async fn summarize_compaction(&self, snapshot: &CoreSnapshot) -> Result<String, ProviderError> {
+        let pending = snapshot
+            .compaction
+            .pending
+            .as_ref()
+            .ok_or(ProviderError::MissingCompletion)?;
+        let start = usize::try_from(snapshot.compaction.first_kept_message)
+            .unwrap_or(usize::MAX)
+            .min(snapshot.messages.len());
+        let end = usize::try_from(pending.first_kept_message)
+            .unwrap_or(usize::MAX)
+            .min(snapshot.messages.len());
+        if end <= start {
+            return Err(ProviderError::MissingCompletion);
+        }
+
+        let mut compact_snapshot = snapshot.clone();
+        compact_snapshot.messages.clear();
+        if !snapshot.compaction.summary.is_empty() {
+            compact_snapshot.messages.push(CoreMessage {
+                role: "user".to_owned(),
+                content: format!(
+                    "Previous compaction summary:\n{}",
+                    snapshot.compaction.summary
+                ),
+                ..CoreMessage::default()
+            });
+        }
+        compact_snapshot
+            .messages
+            .extend_from_slice(&snapshot.messages[start..end]);
+        let custom = pending
+            .instructions
+            .as_deref()
+            .map(|instructions| format!("\n\nAdditional instructions:\n{instructions}"))
+            .unwrap_or_default();
+        compact_snapshot.messages.push(CoreMessage {
+            role: "user".to_owned(),
+            content: format!(
+                "Summarize the conversation above for a coding agent that will continue the same work. Preserve user goals and constraints, decisions and invariants, files read or changed, tool outcomes, errors and blockers, verification evidence, and unresolved work. Do not add new instructions or claim unfinished work is complete.{custom}"
+            ),
+            ..CoreMessage::default()
+        });
+        compact_snapshot.compaction = CoreCompactionState::default();
+
+        let system_prompt = "You produce bounded, factual continuation summaries for coding-agent sessions. Return only the summary.";
+        let completion = match self.provider {
+            Provider::Openai | Provider::Linewise => {
+                self.complete_openai(&compact_snapshot, &[], system_prompt)
+                    .await?
+            }
+            Provider::Anthropic => {
+                self.complete_anthropic(&compact_snapshot, &[], system_prompt)
+                    .await?
+            }
+        };
+        if !completion.tool_calls.is_empty() || completion.content.trim().is_empty() {
+            return Err(ProviderError::MissingCompletion);
+        }
+        Ok(completion.content)
+    }
+
     async fn complete_openai(
         &self,
         snapshot: &CoreSnapshot,
         tools: &[ToolSpec],
+        system_prompt: &str,
     ) -> Result<ModelCompletion, ProviderError> {
-        let system_prompt = self.rendered_system_prompt(snapshot);
+        let active_messages = active_model_messages(snapshot);
         let mut messages = vec![json!({"role": "system", "content": system_prompt})];
-        for message in &snapshot.messages {
+        for message in &active_messages {
             match message.role.as_str() {
                 "user" => messages.push(json!({"role": "user", "content": message.content})),
                 "assistant" => {
@@ -1316,9 +1515,11 @@ impl ModelClient {
             .map(|calls| parse_openai_tool_calls(calls))
             .transpose()?
             .unwrap_or_default();
+        let input_tokens = provider_input_tokens(&payload, "prompt_tokens");
         Ok(ModelCompletion {
             content,
             tool_calls,
+            input_tokens,
         })
     }
 
@@ -1326,9 +1527,10 @@ impl ModelClient {
         &self,
         snapshot: &CoreSnapshot,
         tools: &[ToolSpec],
+        system_prompt: &str,
     ) -> Result<ModelCompletion, ProviderError> {
-        let system_prompt = self.rendered_system_prompt(snapshot);
-        let messages = anthropic_messages(&snapshot.messages);
+        let active_messages = active_model_messages(snapshot);
+        let messages = anthropic_messages(&active_messages);
         let tools: Vec<Value> = tools
             .iter()
             .map(|tool| {
@@ -1395,9 +1597,11 @@ impl ModelClient {
                 _ => {}
             }
         }
+        let input_tokens = provider_input_tokens(&payload, "input_tokens");
         Ok(ModelCompletion {
             content: text,
             tool_calls,
+            input_tokens,
         })
     }
 }
@@ -2894,6 +3098,7 @@ enum PlanReviewAction {
 
 enum RuntimeAction {
     Submit(String),
+    Compact(Option<String>),
     EnterPlan(String),
     ReplaceTodos(Vec<CoreTodoPhase>),
     PlanReview(PlanReviewAction),
@@ -2942,6 +3147,7 @@ enum KeyAction {
     Quit,
     Cancel,
     Submit(String),
+    Compact(Option<String>),
     EnterPlan(String),
     EditTodos,
     PlanReview(PlanReviewAction),
@@ -2964,6 +3170,8 @@ struct RuntimeResources {
     model_tools: ModelToolCatalogs,
     desired_safe_tools: Vec<String>,
     desired_permission_mode: PermissionMode,
+    auto_compact_enabled: bool,
+    auto_compact_threshold: u64,
     sidechain: BtwSidechainStore,
 }
 
@@ -3088,6 +3296,10 @@ fn model_tool_catalogs(plugin_tools: &[ToolSpec]) -> ModelToolCatalogs {
 async fn main() -> Result<(), AppError> {
     install_terminal_panic_hook();
     let args = Args::parse();
+    let auto_compact_threshold = args
+        .context_window
+        .saturating_mul(u64::from(args.auto_compact_threshold_percent))
+        / 100;
     let session = args.session.clone();
     let restored_session = match session.as_ref() {
         Some(path) => path.try_exists()?,
@@ -3185,6 +3397,15 @@ async fn main() -> Result<(), AppError> {
             app.status = "Plan ready · y approve · r refine · e edit · n cancel".to_owned();
             None
         }
+        "waiting_compaction" => {
+            if args.prompt.is_some() {
+                return Err(AppError::PromptWhileResuming {
+                    phase: app.snapshot.phase.clone(),
+                });
+            }
+            let recovered = core.event(&CoreEvent::compaction_failed()).await?;
+            Some(RuntimeAction::Drive(recovered))
+        }
         phase => {
             return Err(AppError::UnsupportedSessionPhase {
                 phase: phase.to_owned(),
@@ -3198,6 +3419,8 @@ async fn main() -> Result<(), AppError> {
         model_tools,
         desired_safe_tools: safe_tools,
         desired_permission_mode,
+        auto_compact_enabled: !args.no_auto_compact,
+        auto_compact_threshold,
         sidechain,
     }));
     run_tui(&mut app, Arc::clone(&runtime), initial_action).await?;
@@ -3504,6 +3727,15 @@ async fn tui_loop(
                                     updates.clone(),
                                 ));
                             }
+                            KeyAction::Compact(instructions) if active.is_none() => {
+                                app.busy = true;
+                                app.status = "Compacting context…".to_owned();
+                                active = Some(spawn_runtime_action(
+                                    Arc::clone(&runtime),
+                                    RuntimeAction::Compact(instructions),
+                                    updates.clone(),
+                                ));
+                            }
                             KeyAction::EnterPlan(text) if active.is_none() => {
                                 app.busy = true;
                                 app.status = "Entering plan mode…".to_owned();
@@ -3584,6 +3816,7 @@ async fn tui_loop(
                                 ));
                             }
                             KeyAction::Submit(_)
+                            | KeyAction::Compact(_)
                             | KeyAction::EnterPlan(_)
                             | KeyAction::EditTodos
                             | KeyAction::PlanReview(_)
@@ -3814,6 +4047,16 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.clear_input();
                     KeyAction::Quit
                 }
+                Ok(UserSubmission::Command(SlashCommand::Compact(instructions))) => {
+                    app.clear_input();
+                    if app.snapshot.phase == "idle" && !app.busy {
+                        KeyAction::Compact(instructions)
+                    } else {
+                        app.status =
+                            "Error: context can be compacted manually only while idle".to_owned();
+                        KeyAction::None
+                    }
+                }
                 Ok(UserSubmission::Command(SlashCommand::Steer(instruction))) => {
                     app.clear_input();
                     if snapshot_accepts_steer(&app.snapshot) {
@@ -3956,6 +4199,13 @@ async fn run_runtime_action(
             let response = runtime.core.event(&CoreEvent::submit(text)).await?;
             drive_response(response, &mut runtime, updates, cancel, steer).await
         }
+        RuntimeAction::Compact(instructions) => {
+            let response = runtime
+                .core
+                .event(&CoreEvent::start_compaction(instructions, 0, false))
+                .await?;
+            drive_response(response, &mut runtime, updates, cancel, steer).await
+        }
         RuntimeAction::EnterPlan(text) => {
             let response = runtime.core.event(&CoreEvent::enter_plan(text)).await?;
             drive_response(response, &mut runtime, updates, cancel, steer).await
@@ -3991,6 +4241,26 @@ async fn run_runtime_action(
     }
 }
 
+fn compaction_cut(snapshot: &CoreSnapshot) -> Option<usize> {
+    let mut users = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, message)| (message.role == "user").then_some(index));
+    let _latest = users.next()?;
+    let second_latest = users.next()?;
+    (u64::try_from(second_latest).ok()? > snapshot.compaction.first_kept_message)
+        .then_some(second_latest)
+}
+
+fn should_auto_compact(runtime: &RuntimeResources, snapshot: &CoreSnapshot) -> bool {
+    runtime.auto_compact_enabled
+        && runtime.auto_compact_threshold > 0
+        && snapshot.compaction.last_input_tokens >= runtime.auto_compact_threshold
+        && compaction_cut(snapshot).is_some()
+}
+
 async fn drive_response(
     response: CoreResponse,
     runtime: &mut RuntimeResources,
@@ -4000,6 +4270,7 @@ async fn drive_response(
 ) -> Result<RuntimeFinal, AppError> {
     let mut snapshot = response.snapshot;
     let mut effects = response.effects;
+    let mut final_status = "Ready".to_owned();
     send_runtime_progress(updates, &snapshot, "Processing…");
     loop {
         while let Some(effect) = effects.pop() {
@@ -4008,8 +4279,24 @@ async fn drive_response(
             }
             match effect.kind.as_str() {
                 "request_model" => {
+                    if should_auto_compact(runtime, &snapshot) {
+                        let next = runtime
+                            .core
+                            .event(&CoreEvent::start_compaction(
+                                None,
+                                snapshot.compaction.last_input_tokens,
+                                true,
+                            ))
+                            .await?;
+                        snapshot = next.snapshot;
+                        effects.clear();
+                        effects.extend(next.effects);
+                        send_runtime_progress(updates, &snapshot, "Auto-compacting context…");
+                        continue;
+                    }
+
                     send_runtime_progress(updates, &snapshot, "Waiting for model…");
-                    let completion = tokio::select! {
+                    let completion_result = tokio::select! {
                         biased;
                         () = cancel.cancelled() => return cancel_runtime(runtime).await,
                         Some(text) = steer.recv() => {
@@ -4028,15 +4315,63 @@ async fn drive_response(
                                 &runtime.model_tools.normal
                             },
                             &runtime.model_tools.declared,
-                        ) => result?,
+                        ) => result,
+                    };
+                    let completion = match completion_result {
+                        Ok(completion) => completion,
+                        Err(error)
+                            if error.is_context_overflow()
+                                && compaction_cut(&snapshot).is_some() =>
+                        {
+                            let next = runtime
+                                .core
+                                .event(&CoreEvent::start_compaction(
+                                    None,
+                                    snapshot.compaction.last_input_tokens,
+                                    true,
+                                ))
+                                .await?;
+                            snapshot = next.snapshot;
+                            effects.clear();
+                            effects.extend(next.effects);
+                            send_runtime_progress(
+                                updates,
+                                &snapshot,
+                                "Recovering context overflow…",
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
                     };
                     let next = runtime
                         .core
                         .event(&CoreEvent::model_completed(
                             completion.content,
                             completion.tool_calls,
+                            completion.input_tokens,
                         ))
                         .await?;
+                    snapshot = next.snapshot;
+                    effects.extend(next.effects);
+                }
+                "request_compaction" => {
+                    send_runtime_progress(updates, &snapshot, "Summarizing old context…");
+                    let summary_result = tokio::select! {
+                        () = cancel.cancelled() => return cancel_runtime(runtime).await,
+                        result = runtime.provider.summarize_compaction(&snapshot) => result,
+                    };
+                    let next = match summary_result {
+                        Ok(summary) => {
+                            runtime
+                                .core
+                                .event(&CoreEvent::compaction_completed(summary))
+                                .await?
+                        }
+                        Err(error) => {
+                            final_status = format!("Compaction failed: {error}");
+                            runtime.core.event(&CoreEvent::compaction_failed()).await?
+                        }
+                    };
                     snapshot = next.snapshot;
                     effects.extend(next.effects);
                 }
@@ -4128,6 +4463,20 @@ async fn drive_response(
                 _ => return Err(AppError::UnknownCoreEffect { kind: effect.kind }),
             }
         }
+        if snapshot.phase == "idle" && should_auto_compact(runtime, &snapshot) {
+            let next = runtime
+                .core
+                .event(&CoreEvent::start_compaction(
+                    None,
+                    snapshot.compaction.last_input_tokens,
+                    true,
+                ))
+                .await?;
+            snapshot = next.snapshot;
+            effects.extend(next.effects);
+            send_runtime_progress(updates, &snapshot, "Auto-compacting context…");
+            continue;
+        }
         let Ok(text) = steer.try_recv() else {
             break;
         };
@@ -4140,7 +4489,7 @@ async fn drive_response(
     let plan_review = snapshot.phase == "waiting_plan_review";
     Ok(RuntimeFinal {
         snapshot,
-        status: "Ready".to_owned(),
+        status: final_status,
         approval: None,
         plan_review,
         local_entry: None,
@@ -4362,7 +4711,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let phase_color = match app.snapshot.phase.as_str() {
         "idle" => COLOR_ASSISTANT,
         "waiting_approval" | "waiting_plan_review" => COLOR_TOOL,
-        "waiting_model" | "waiting_tool" => COLOR_ACCENT,
+        "waiting_model" | "waiting_tool" | "waiting_compaction" => COLOR_ACCENT,
         _ => COLOR_MUTED,
     };
     let mut header_spans = vec![
@@ -4392,6 +4741,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             } else {
                 COLOR_MUTED
             }),
+        ));
+    }
+    if app.snapshot.compaction.revision > 0 {
+        header_spans.push(Span::styled(
+            format!("  compact r{}", app.snapshot.compaction.revision),
+            Style::default().fg(COLOR_MUTED),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header);
@@ -4545,9 +4900,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · pending {} · todos {} · steer {} · safe {} · permission {}{scroll}{details}",
+                    " · pending {} · todos {} · context {} · compact r{} · steer {} · safe {} · permission {}{scroll}{details}",
                     app.snapshot.pending_calls.len(),
                     app.snapshot.todos.iter().map(|phase| phase.tasks.len()).sum::<usize>(),
+                    app.snapshot.compaction.last_input_tokens,
+                    app.snapshot.compaction.revision,
                     app.snapshot.pending_steers.len(),
                     app.snapshot.safe_tools.len(),
                     app.snapshot.permission_mode
@@ -4590,14 +4947,15 @@ mod tests {
 
     use super::{
         App, Args, BtwSidechainStore, COLOR_ACCENT, COLOR_ASSISTANT_BACKGROUND, COLOR_MUTED,
-        COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CorePlanState, CoreSnapshot, CoreTodoItem,
-        CoreTodoPhase, CoreToolCall, KeyAction, LiveToolOutput, LocalTranscriptEntry, MouseAction,
-        PermissionMode, PlanReviewAction, SelectionPoint, SelectionRegion, SlashCommand,
-        SlashCommandError, TextSelection, ToolOutputStream, ToolSpec, TranscriptLayoutCache,
-        UserSubmission, anthropic_messages, automatically_safe_tool_names, btw_sidechain_path,
-        build_live_tool_lines, build_transcript_lines, draw, handle_key, model_tool_catalogs,
-        parse_openai_tool_calls, parse_submission, parse_todos_markdown, startup_permission_mode,
-        text_between_columns, todos_to_markdown,
+        COLOR_USER_BACKGROUND, CoreCompactionState, CoreEvent, CoreMessage, CorePlanState,
+        CoreSnapshot, CoreTodoItem, CoreTodoPhase, CoreToolCall, KeyAction, LiveToolOutput,
+        LocalTranscriptEntry, MouseAction, PermissionMode, PlanReviewAction, ProviderError,
+        SelectionPoint, SelectionRegion, SlashCommand, SlashCommandError, TextSelection,
+        ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission, active_model_messages,
+        anthropic_messages, automatically_safe_tool_names, btw_sidechain_path,
+        build_live_tool_lines, build_transcript_lines, compaction_cut, draw, handle_key,
+        model_tool_catalogs, parse_openai_tool_calls, parse_submission, parse_todos_markdown,
+        provider_input_tokens, startup_permission_mode, text_between_columns, todos_to_markdown,
     };
 
     #[test]
@@ -4610,6 +4968,102 @@ mod tests {
             .expect("function call must parse");
         assert_eq!(parsed[0].name, "read");
         assert_eq!(parsed[0].arguments["path"], "Main.lean");
+    }
+
+    #[test]
+    fn parses_provider_input_usage() {
+        assert_eq!(
+            provider_input_tokens(
+                &serde_json::json!({"usage": {"prompt_tokens": 1234}}),
+                "prompt_tokens"
+            ),
+            1234
+        );
+        assert_eq!(
+            provider_input_tokens(
+                &serde_json::json!({"usage": {"input_tokens": 5678}}),
+                "input_tokens"
+            ),
+            5678
+        );
+        assert_eq!(
+            provider_input_tokens(&serde_json::json!({}), "input_tokens"),
+            0
+        );
+    }
+
+    #[test]
+    fn compacted_model_context_keeps_summary_and_recent_turns() {
+        let snapshot = CoreSnapshot {
+            messages: vec![
+                CoreMessage {
+                    role: "user".to_owned(),
+                    content: "old request".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "old answer".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "user".to_owned(),
+                    content: "recent request".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "recent answer".to_owned(),
+                    ..CoreMessage::default()
+                },
+            ],
+            compaction: CoreCompactionState {
+                revision: 1,
+                summary: "old decisions".to_owned(),
+                first_kept_message: 2,
+                ..CoreCompactionState::default()
+            },
+            ..CoreSnapshot::default()
+        };
+        let messages = active_model_messages(&snapshot);
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].content.contains("old decisions"));
+        assert_eq!(messages[1].content, "recent request");
+        assert_eq!(messages[2].content, "recent answer");
+    }
+
+    #[test]
+    fn compaction_cut_keeps_two_latest_user_turns() {
+        let snapshot = CoreSnapshot {
+            messages: ["one", "two", "three"]
+                .into_iter()
+                .flat_map(|content| {
+                    [
+                        CoreMessage {
+                            role: "user".to_owned(),
+                            content: content.to_owned(),
+                            ..CoreMessage::default()
+                        },
+                        CoreMessage {
+                            role: "assistant".to_owned(),
+                            content: "answer".to_owned(),
+                            ..CoreMessage::default()
+                        },
+                    ]
+                })
+                .collect(),
+            ..CoreSnapshot::default()
+        };
+        assert_eq!(compaction_cut(&snapshot), Some(2));
+    }
+
+    #[test]
+    fn classifies_provider_context_overflow() {
+        let error = ProviderError::Status {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "maximum context length exceeded".to_owned(),
+        };
+        assert!(error.is_context_overflow());
     }
 
     #[test]
@@ -4670,6 +5124,9 @@ mod tests {
             "plugin",
         ])
         .expect("base arguments must parse");
+        assert_eq!(implicit.context_window, 128_000);
+        assert_eq!(implicit.auto_compact_threshold_percent, 80);
+        assert!(!implicit.no_auto_compact);
         let explicit = Args::try_parse_from([
             "mycode-tui",
             "--provider",
@@ -4727,6 +5184,16 @@ mod tests {
             Ok(UserSubmission::Command(SlashCommand::Todo))
         );
         assert_eq!(
+            parse_submission("/compact".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Compact(None)))
+        );
+        assert_eq!(
+            parse_submission("/compact preserve API decisions".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Compact(Some(
+                "preserve API decisions".to_owned()
+            ))))
+        );
+        assert_eq!(
             parse_submission("/exit".to_owned()),
             Ok(UserSubmission::Command(SlashCommand::Exit))
         );
@@ -4748,14 +5215,14 @@ mod tests {
         let mut app = App::new(CoreSnapshot::default());
         app.input = "/".to_owned();
         assert!(app.slash_menu_visible());
-        assert_eq!(app.slash_candidate_count(), 5);
+        assert_eq!(app.slash_candidate_count(), 6);
 
         let action = handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, KeyAction::None));
         assert_eq!(app.slash_selection, 1);
         let action = handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, KeyAction::None));
-        assert_eq!(app.input, "/exit");
+        assert_eq!(app.input, "/compact ");
         assert!(!app.slash_menu_visible());
 
         app.input = "/b".to_owned();
@@ -4782,7 +5249,7 @@ mod tests {
         app.follow_tail = true;
 
         let _ = handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.slash_selection, 4);
+        assert_eq!(app.slash_selection, 5);
         assert_eq!(app.scroll_offset, 20);
         assert!(app.follow_tail);
 
@@ -5511,7 +5978,7 @@ mod tests {
             "└─ bash  git status --short",
             "└ Tool result",
             "Message · Enter send",
-            "Ready · pending 0 · todos 0 · steer 0 · safe 2",
+            "Ready · pending 0 · todos 0 · context 0 · compact r0 · steer 0 · safe 2",
         ] {
             assert!(
                 screen.contains(expected),

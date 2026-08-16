@@ -29,6 +29,15 @@ private def bashCall (callId command : String) : ToolCall := {
   arguments := Json.mkObj [("command", toJson command)]
 }
 
+private def completeTurn (state : State) (prompt answer : String) (inputTokens : Nat) : IO State := do
+  let (submitted, _) ← step state { kind := "submit", text? := some prompt }
+  let (completed, _) ← step submitted {
+    kind := "model_completed"
+    content? := some answer
+    inputTokens
+  }
+  pure completed
+
 private def testSafeToolFlowsDirectlyToExecutor : IO Unit := do
   let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read"] }
   let (submitted, submitEffects) ← step configured { kind := "submit", text? := some "Inspect Main.lean" }
@@ -376,6 +385,70 @@ private def testPlanReviewBlocksWritesAndSupportsRevision : IO Unit := do
   assert (approvalEffects.size == 1 && approvalEffects[0]!.kind == "request_model")
     "approved plan must request the execution turn"
 
+private def testManualCompactionPreservesHistory : IO Unit := do
+  let first ← completeTurn {} "First request" "First answer" 100
+  let second ← completeTurn first "Second request" "Second answer" 200
+  let third ← completeTurn second "Third request" "Third answer" 300
+  assert (third.messages.size == 6 && third.compaction.lastInputTokens == 300)
+    "model completion must retain full history and input usage"
+
+  let (compacting, effects) ← step third {
+    kind := "start_compaction"
+    text? := some "Preserve storage decisions."
+    inputTokens := 300
+  }
+  assert (compacting.phase.label == "waiting_compaction") "manual compact must enter compaction phase"
+  assert (effects.size == 1 && effects[0]!.kind == "request_compaction")
+    "manual compact must request one summary"
+  let pending := compacting.compaction.pending?.get!
+  assert (pending.firstKeptMessage == 2 && !pending.automatic && !pending.continueAfter)
+    "manual compact must keep the latest two complete user turns"
+
+  let summary := "The first request established the storage constraint."
+  let (compacted, completedEffects) ← step compacting {
+    kind := "compaction_completed"
+    content? := some summary
+  }
+  assert (compacted.phase.label == "idle" && completedEffects.isEmpty)
+    "manual compact must return to idle"
+  assert (compacted.messages.size == 6) "compaction must never delete canonical transcript messages"
+  assert (compacted.compaction.revision == 1 && compacted.compaction.summary == summary)
+    "compaction must persist its summary and revision"
+  assert (compacted.compaction.firstKeptMessage == 2 && compacted.compaction.lastInputTokens == 0)
+    "compaction must persist its cut and reset the threshold observation"
+
+private def testAutomaticCompactionResumesModelAndRecoversFailure : IO Unit := do
+  let first ← completeTurn {} "First request" "First answer" 100
+  let second ← completeTurn first "Second request" "Second answer" 200
+  let third ← completeTurn second "Third request" "Third answer" 900
+  let (waiting, _) ← step third { kind := "submit", text? := some "Fourth request" }
+
+  let (compacting, effects) ← step waiting {
+    kind := "start_compaction"
+    inputTokens := 900
+    automatic := true
+  }
+  assert (effects.size == 1 && effects[0]!.kind == "request_compaction")
+    "automatic compact must request a summary"
+  let pending := compacting.compaction.pending?.get!
+  assert (pending.automatic && pending.continueAfter) "pre-request compact must remember to resume"
+
+  let (recovered, recoveryEffects) ← step compacting { kind := "compaction_failed" }
+  assert (recovered.phase.label == "waiting_model") "failed pre-request compact must restore model phase"
+  assert (recoveryEffects.size == 1 && recoveryEffects[0]!.kind == "request_model")
+    "failed pre-request compact must continue without looping"
+  assert (recovered.compaction.pending?.isNone && recovered.compaction.lastInputTokens == 0)
+    "failed compact must clear pending state and its trigger observation"
+
+private def testAbortClearsPendingCompaction : IO Unit := do
+  let first ← completeTurn {} "First request" "First answer" 100
+  let second ← completeTurn first "Second request" "Second answer" 200
+  let third ← completeTurn second "Third request" "Third answer" 300
+  let (compacting, _) ← step third { kind := "start_compaction" }
+  let (aborted, effects) ← step compacting { kind := "abort" }
+  assert (aborted.phase.label == "idle" && effects.isEmpty) "abort must stop manual compaction"
+  assert aborted.compaction.pending?.isNone "abort must clear pending compaction state"
+
 private def testLegacySessionDefaultsToAsk : IO Unit := do
   let legacy := Json.mkObj [
     ("phase", toJson Phase.idle),
@@ -390,6 +463,8 @@ private def testLegacySessionDefaultsToAsk : IO Unit := do
     assert state.pendingSteers.isEmpty "legacy session must default to no queued steer"
     assert (!state.plan.enabled && state.plan.revision == 0) "legacy session must default to no plan"
     assert state.todos.isEmpty "legacy session must default to no todos"
+    assert (state.compaction.revision == 0 && state.compaction.pending?.isNone)
+      "legacy session must default to no compaction"
   | .error error => throw (IO.userError s!"legacy session failed to decode: {error}")
 def main : IO Unit := do
   testSafeToolFlowsDirectlyToExecutor
@@ -411,5 +486,8 @@ def main : IO Unit := do
   testTodoBuiltinPersistsLifecycle
   testHumanTodoReplacementIsValidated
   testPlanReviewBlocksWritesAndSupportsRevision
+  testManualCompactionPreservesHistory
+  testAutomaticCompactionResumesModelAndRecoversFailure
+  testAbortClearsPendingCompaction
   testLegacySessionDefaultsToAsk
   IO.println "MyCode core tests passed"
