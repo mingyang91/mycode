@@ -17,6 +17,12 @@ private def call (callId name : String) : ToolCall := {
   arguments := Json.mkObj []
 }
 
+private def callWithArgs (callId name : String) (arguments : Json) : ToolCall := {
+  callId
+  name
+  arguments
+}
+
 private def bashCall (callId command : String) : ToolCall := {
   callId
   name := "bash"
@@ -255,6 +261,121 @@ private def testPermissionModesFailClosedAndYolo : IO Unit := do
   assert (yoloNext.phase.label == "waiting_tool") "yolo mode must allow write"
   assert (yoloEffects[0]!.kind == "invoke_tool") "yolo write must invoke directly"
 
+private def testTodoBuiltinPersistsLifecycle : IO Unit := do
+  let phases : Array TodoPhase := #[{
+    name := "Implementation"
+    tasks := #[
+      { content := "Add protocol" },
+      { content := "Run verification" }
+    ]
+  }]
+  let (submitted, _) ← step {} { kind := "submit", text? := some "Track this work" }
+  let (initialized, initEffects) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[callWithArgs "call-todo-init" "todo" <| Json.mkObj [
+      ("op", toJson "init"),
+      ("phases", toJson phases)
+    ]]
+  }
+  assert (initialized.phase.label == "waiting_model") "todo init must continue the model turn"
+  assert (initEffects.size == 1 && initEffects[0]!.kind == "request_model")
+    "todo init must request a follow-up model response"
+  assert (initialized.todos == phases) "todo init must persist structured phases"
+  assert (initialized.messages.back!.role == "tool" && !initialized.messages.back!.isError)
+    "todo init must close its tool call successfully"
+
+  let (started, _) ← step initialized {
+    kind := "model_completed"
+    toolCalls := #[callWithArgs "call-todo-start" "todo" <| Json.mkObj [
+      ("op", toJson "start"),
+      ("task", toJson "Add protocol")
+    ]]
+  }
+  assert (started.todos[0]!.tasks[0]!.status == "in_progress") "todo start must select the active task"
+
+  let (completed, _) ← step started {
+    kind := "model_completed"
+    toolCalls := #[callWithArgs "call-todo-done" "todo" <| Json.mkObj [
+      ("op", toJson "done"),
+      ("task", toJson "Add protocol")
+    ]]
+  }
+  assert (completed.todos[0]!.tasks[0]!.status == "completed") "todo done must persist completion"
+
+private def testHumanTodoReplacementIsValidated : IO Unit := do
+  let phases : Array TodoPhase := #[{
+    name := "Review"
+    tasks := #[{ content := "Inspect the plan", status := "in_progress" }]
+  }]
+  let (updated, effects) ← step {} { kind := "replace_todos", todos := phases }
+  assert (updated.todos == phases) "human todo replacement must become canonical state"
+  assert effects.isEmpty "human todo replacement must not emit an external effect"
+
+private def testPlanReviewBlocksWritesAndSupportsRevision : IO Unit := do
+  let (configured, _) ← step {} {
+    kind := "configure_tools"
+    safeTools := #["read"]
+    permissionMode := "yolo"
+  }
+  let (planning, effects) ← step configured { kind := "enter_plan", text? := some "Design safer storage" }
+  assert (planning.plan.enabled && planning.plan.status == "draft") "enter_plan must enable draft mode"
+  assert (effects.size == 1 && effects[0]!.kind == "request_model") "enter_plan must request the model"
+
+  let firstPlan := "# Safer storage\n\n1. Inspect the current format.\n2. Propose a migration."
+  let (review, reviewEffects) ← step planning {
+    kind := "model_completed"
+    toolCalls := #[
+      call "call-plan-write" "write",
+      callWithArgs "call-plan-propose" "plan" <| Json.mkObj [
+        ("op", toJson "propose"),
+        ("content", toJson firstPlan)
+      ]
+    ]
+  }
+  assert (review.phase.label == "waiting_plan_review") "plan proposal must wait for human review"
+  assert (reviewEffects.size == 1 && reviewEffects[0]!.kind == "request_plan_review")
+    "plan proposal must emit only the review effect"
+  assert (review.messages[2]!.isError && review.messages[2]!.toolCallId? == some "call-plan-write")
+    "plan mode must block workspace writes even in yolo"
+  assert (review.plan.revision == 1 && review.plan.content == firstPlan) "proposal must persist revision one"
+
+  let editedPlan := firstPlan ++ "\n3. Verify rollback."
+  let (edited, editEffects) ← step review {
+    kind := "plan_review_result"
+    content? := some editedPlan
+  }
+  assert (edited.phase.label == "waiting_plan_review" && edited.plan.revision == 2)
+    "human plan edits must create a new review revision"
+  assert (editEffects.size == 1 && editEffects[0]!.kind == "request_plan_review")
+    "edited plan must return to review"
+
+  let (refining, refineEffects) ← step edited {
+    kind := "plan_review_result"
+    text? := some "Use a bounded migration batch."
+  }
+  assert (refining.phase.label == "waiting_model" && refining.plan.status == "draft")
+    "review feedback must return to planning"
+  assert (refineEffects.size == 1 && refineEffects[0]!.kind == "request_model")
+    "review feedback must request a replacement plan"
+
+  let finalPlan := editedPlan ++ "\n4. Bound every batch."
+  let (finalReview, _) ← step refining {
+    kind := "model_completed"
+    toolCalls := #[callWithArgs "call-plan-final" "plan" <| Json.mkObj [
+      ("op", toJson "propose"),
+      ("content", toJson finalPlan)
+    ]]
+  }
+  let (approved, approvalEffects) ← step finalReview {
+    kind := "plan_review_result"
+    approved? := some true
+  }
+  assert (!approved.plan.enabled && approved.plan.status == "approved")
+    "plan approval must leave plan mode"
+  assert (approved.phase.label == "waiting_model") "approved plan must begin execution"
+  assert (approvalEffects.size == 1 && approvalEffects[0]!.kind == "request_model")
+    "approved plan must request the execution turn"
+
 private def testLegacySessionDefaultsToAsk : IO Unit := do
   let legacy := Json.mkObj [
     ("phase", toJson Phase.idle),
@@ -267,6 +388,8 @@ private def testLegacySessionDefaultsToAsk : IO Unit := do
   | .ok state =>
     assert (state.permissionMode == "ask") "legacy session must default to ask"
     assert state.pendingSteers.isEmpty "legacy session must default to no queued steer"
+    assert (!state.plan.enabled && state.plan.revision == 0) "legacy session must default to no plan"
+    assert state.todos.isEmpty "legacy session must default to no todos"
   | .error error => throw (IO.userError s!"legacy session failed to decode: {error}")
 def main : IO Unit := do
   testSafeToolFlowsDirectlyToExecutor
@@ -285,5 +408,8 @@ def main : IO Unit := do
   testAutoPermissionRejectsUnsafeReads
   testAutoPermissionRejectsLsOperandsAndGlobs
   testPermissionModesFailClosedAndYolo
+  testTodoBuiltinPersistsLifecycle
+  testHumanTodoReplacementIsValidated
+  testPlanReviewBlocksWritesAndSupportsRevision
   testLegacySessionDefaultsToAsk
   IO.println "MyCode core tests passed"

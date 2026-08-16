@@ -1,4 +1,5 @@
 import MyCode.Git
+import MyCode.Planning
 
 namespace MyCode
 
@@ -16,15 +17,6 @@ private def isSafeTool (state : State) (call : ToolCall) : Bool :=
 private def appendMessage (state : State) (message : ChatMessage) : State :=
   { state with messages := state.messages.push message }
 
-private def advance (state : State) : State × Array Effect :=
-  match currentTool? state with
-  | none =>
-    ({ state with phase := .waitingModel, pendingCalls := #[], currentCall := 0 }, #[Effect.requestModel])
-  | some call =>
-    if isSafeTool state call then
-      ({ state with phase := .waitingTool call.callId }, #[Effect.invokeTool call])
-    else
-      ({ state with phase := .waitingApproval call.callId }, #[Effect.requestApproval call])
 
 private def denyCurrentTool (state : State) (call : ToolCall) : State :=
   appendMessage state {
@@ -41,6 +33,43 @@ private def finishTool (state : State) (call : ToolCall) (content : String) (isE
     toolCallId? := some call.callId
     isError
   }
+
+private def advanceWithFuel (state : State) (fuel : Nat) : State × Array Effect :=
+  match currentTool? state with
+  | none =>
+    ({ state with phase := .waitingModel, pendingCalls := #[], currentCall := 0 }, #[Effect.requestModel])
+  | some call =>
+    match applyBuiltinTool? state call with
+    | some result =>
+      let completed := { finishTool result.state call result.content result.isError with
+        currentCall := state.currentCall + 1 }
+      if result.requestPlanReview && !result.isError then
+        let unanswered := completed.pendingCalls.toList.drop completed.currentCall
+        let closed := unanswered.foldl (fun next pending =>
+          finishTool next pending "Tool call skipped because the plan is awaiting review." true) completed
+        ({ closed with phase := .waitingPlanReview, pendingCalls := #[], currentCall := 0 },
+          #[Effect.requestPlanReview])
+      else
+        match fuel with
+        | 0 => ({ completed with phase := .idle, pendingCalls := #[], currentCall := 0 }, #[])
+        | remaining + 1 => advanceWithFuel completed remaining
+    | none =>
+      if state.plan.enabled then
+        if state.safeTools.any (fun name => name == call.name) || call.autoPermissionAllowed then
+          ({ state with phase := .waitingTool call.callId }, #[Effect.invokeTool call])
+        else
+          let denied := { finishTool state call "Tool is unavailable while plan mode is active." true with
+            currentCall := state.currentCall + 1 }
+          match fuel with
+          | 0 => ({ denied with phase := .idle, pendingCalls := #[], currentCall := 0 }, #[])
+          | remaining + 1 => advanceWithFuel denied remaining
+      else if isSafeTool state call then
+        ({ state with phase := .waitingTool call.callId }, #[Effect.invokeTool call])
+      else
+        ({ state with phase := .waitingApproval call.callId }, #[Effect.requestApproval call])
+
+private def advance (state : State) : State × Array Effect :=
+  advanceWithFuel state (state.pendingCalls.size + 1)
 
 private def finishPendingTools (state : State) (content : String) : State :=
   let unanswered := state.pendingCalls.toList.drop state.currentCall
@@ -83,6 +112,25 @@ public def transition (state : State) (event : Event) : Except String (State × 
         permissionMode := normalizedPermissionMode event.permissionMode
       }, #[])
     | _ => throw "tool catalogue cannot change while the agent is running"
+  | "enter_plan" =>
+    requireIdle state "enter plan mode"
+    match event.text? with
+    | some text =>
+      if text.trimAscii.isEmpty then throw "plan request must not be empty"
+      else
+        let planning := { state with
+          phase := .waitingModel
+          plan := { state.plan with enabled := true, status := "draft" }
+        }
+        let next := appendMessage planning { role := "user", content := text }
+        pure (next, #[Effect.requestModel])
+    | none => throw "enter_plan event is missing text"
+  | "replace_todos" =>
+    match state.phase with
+    | .idle | .waitingPlanReview =>
+      validateTodoPhases event.todos
+      pure ({ state with todos := event.todos }, #[])
+    | _ => throw "cannot replace todos while the agent is running"
   | "submit" =>
     requireIdle state "submit a prompt"
     match event.text? with
@@ -103,6 +151,7 @@ public def transition (state : State) (event : Event) : Except String (State × 
         | .waitingTool _ => pure (queued, #[])
         | .waitingModel => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
         | .waitingApproval _ => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
+        | .waitingPlanReview => throw "cannot steer while a plan is awaiting review"
     | none => throw "steer event is missing text"
   | "model_completed" =>
     match state.phase with
@@ -144,6 +193,39 @@ public def transition (state : State) (event : Event) : Except String (State × 
         else pure (resumeWithPendingSteers next, #[Effect.requestModel])
       | none => throw "tool_completed arrived without a pending tool call"
     | _ => throw "tool_completed arrived without a running tool"
+  | "plan_review_result" =>
+    match state.phase with
+    | .waitingPlanReview =>
+      match event.approved?, event.content?, event.text? with
+      | some true, _, _ =>
+        let plan := { state.plan with enabled := false, status := "approved" }
+        let approved := appendMessage { state with phase := .waitingModel, plan } {
+          role := "user"
+          content := s!"Plan revision {plan.revision} approved. Execute it and keep the todo list current."
+        }
+        pure (approved, #[Effect.requestModel])
+      | _, some content, _ =>
+        validatePlanContent content
+        let plan := {
+          enabled := true
+          revision := state.plan.revision + 1
+          status := "review"
+          content
+        }
+        pure ({ state with plan, phase := .waitingPlanReview }, #[Effect.requestPlanReview])
+      | _, _, some feedback =>
+        if feedback.trimAscii.isEmpty then throw "plan feedback must not be empty"
+        else
+          let plan := { state.plan with enabled := true, status := "draft" }
+          let revised := appendMessage { state with phase := .waitingModel, plan } {
+            role := "user"
+            content := s!"Plan review feedback: {feedback}"
+          }
+          pure (revised, #[Effect.requestModel])
+      | some false, none, none =>
+        pure ({ state with phase := .idle, plan := { state.plan with status := "draft" } }, #[])
+      | none, none, none => throw "plan_review_result is missing a decision"
+    | _ => throw "plan_review_result arrived without a pending plan review"
   | "abort" =>
     pure (abortPendingTools state, #[])
   | _ => throw s!"unknown event kind: {event.kind}"

@@ -12,6 +12,8 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.
 - Steer belongs to the main Lean state, unlike the independent BTW sidechain. A steer replaces an in-flight model request; during a tool it is persisted until the current result is known, then Lean synthesizes results for every skipped tool before appending the new user instruction.
+- Plan and todo are built-in control state, not plugin effects. Lean owns the canonical Markdown plan, its revision and review phase, plus phased todo items. In plan mode Lean permits only configured safe tools and closed read-only commands, even under `yolo`.
+- `/plan <goal>` starts read-only planning. The model updates todos and submits a Markdown plan through the built-in `plan` tool; the TUI lets the user approve, refine, cancel, or edit it with `$VISUAL`/`$EDITOR`. `/todo` round-trips the same canonical todo state through a bounded Markdown editor.
 - Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
 - The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
 - Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights text and copies the bounded selection through OSC 52 on release; a click without a drag clears selection without writing to the clipboard.
@@ -55,7 +57,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, model-request and tool-boundary steer, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
+For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, model-request and tool-boundary steer, plan proposal → interactive review → approved execution, persisted todo state, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
 
 ## Git
 
