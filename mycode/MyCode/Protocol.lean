@@ -4,7 +4,7 @@ open Lean
 
 namespace MyCode
 
-public def protocolVersion : Nat := 3
+public def protocolVersion : Nat := 4
 
 public structure ToolCall where
   callId : String
@@ -26,6 +26,7 @@ public inductive Phase where
   | waitingApproval (callId : String)
   | waitingTool (callId : String)
   | waitingPlanReview
+  | waitingCompaction
   deriving Inhabited, Repr, ToJson, FromJson
 
 public def Phase.label : Phase → String
@@ -34,6 +35,7 @@ public def Phase.label : Phase → String
   | .waitingApproval _ => "waiting_approval"
   | .waitingTool _ => "waiting_tool"
   | .waitingPlanReview => "waiting_plan_review"
+  | .waitingCompaction => "waiting_compaction"
 
 public structure TodoItem where
   content : String
@@ -52,6 +54,23 @@ public structure PlanState where
   content : String := ""
   deriving Inhabited, ToJson, FromJson
 
+public structure PendingCompaction where
+  firstKeptMessage : Nat
+  tokensBefore : Nat
+  instructions? : Option String := none
+  automatic : Bool := false
+  continueAfter : Bool := false
+  deriving Inhabited, ToJson, FromJson
+
+public structure CompactionState where
+  revision : Nat := 0
+  summary : String := ""
+  firstKeptMessage : Nat := 0
+  tokensBefore : Nat := 0
+  lastInputTokens : Nat := 0
+  pending? : Option PendingCompaction := none
+  deriving Inhabited, ToJson, FromJson
+
 public structure State where
   phase : Phase := .idle
   messages : Array ChatMessage := #[]
@@ -62,6 +81,7 @@ public structure State where
   pendingSteers : Array String := #[]
   plan : PlanState := {}
   todos : Array TodoPhase := #[]
+  compaction : CompactionState := {}
   deriving Inhabited, ToJson, FromJson
 
 public structure Event where
@@ -75,6 +95,8 @@ public structure Event where
   safeTools : Array String := #[]
   permissionMode : String := "ask"
   todos : Array TodoPhase := #[]
+  inputTokens : Nat := 0
+  automatic : Bool := false
   deriving Inhabited, ToJson, FromJson
 
 public structure Effect where
@@ -92,6 +114,7 @@ public structure Snapshot where
   pendingSteers : Array String
   plan : PlanState
   todos : Array TodoPhase
+  compaction : CompactionState
   deriving Inhabited, ToJson, FromJson
 
 public def State.snapshot (state : State) : Snapshot := {
@@ -104,6 +127,7 @@ public def State.snapshot (state : State) : Snapshot := {
   pendingSteers := state.pendingSteers
   plan := state.plan
   todos := state.todos
+  compaction := state.compaction
 }
 
 private def setDefaultField (json : Json) (name : String) (value : Json) : Json :=
@@ -117,7 +141,8 @@ public def State.fromJsonWithDefaults (json : Json) : Except String State :=
       let withPermission := setDefaultField json "permissionMode" (toJson "ask")
       let withSteers := setDefaultField withPermission "pendingSteers" (toJson (#[] : Array String))
       let withPlan := setDefaultField withSteers "plan" (toJson ({} : PlanState))
-      setDefaultField withPlan "todos" (toJson (#[] : Array TodoPhase))
+      let withTodos := setDefaultField withPlan "todos" (toJson (#[] : Array TodoPhase))
+      setDefaultField withTodos "compaction" (toJson ({} : CompactionState))
     | _ => json
   fromJson? migrated
 
@@ -150,5 +175,7 @@ public def Effect.invokeTool (call : ToolCall) : Effect := {
 }
 
 public def Effect.requestPlanReview : Effect := { kind := "request_plan_review" }
+
+public def Effect.requestCompaction : Effect := { kind := "request_compaction" }
 
 end MyCode

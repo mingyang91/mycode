@@ -14,6 +14,8 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - Steer belongs to the main Lean state, unlike the independent BTW sidechain. A steer replaces an in-flight model request; during a tool it is persisted until the current result is known, then Lean synthesizes results for every skipped tool before appending the new user instruction.
 - Plan and todo are built-in control state, not plugin effects. Lean owns the canonical Markdown plan, its revision and review phase, plus phased todo items. In plan mode Lean permits only configured safe tools and closed read-only commands, even under `yolo`.
 - `/plan <goal>` starts read-only planning. The model updates todos and submits a Markdown plan through the built-in `plan` tool; the TUI lets the user approve, refine, cancel, or edit it with `$VISUAL`/`$EDITOR`. `/todo` round-trips the same canonical todo state through a bounded Markdown editor.
+- Compaction is built-in control state. Lean preserves the complete canonical transcript, chooses user-turn cut points, persists pending compaction before emitting `request_compaction`, and stores the bounded summary plus the first kept message. Rust sends providers only the latest summary and retained suffix.
+- `/compact [instructions]` runs manual context compaction. Automatic compaction uses provider-reported input tokens before a model request and after a completed turn, recovers classified context-overflow responses, and clears its trigger after success or failure to prevent retry loops.
 - Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
 - The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
 - Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights and copies through OSC 52; double-click selects a code word, `Ctrl`+double-click selects one visual line, and triple-click selects the contiguous paragraph block. Copied text excludes rounded box borders, and a click without a drag leaves the clipboard unchanged.
@@ -58,7 +60,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, model-request and tool-boundary steer, plan proposal → interactive review → approved execution, persisted todo state, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
+For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, model-request and tool-boundary steer, plan proposal → interactive review → approved execution, persisted todo state, manual and threshold-triggered compaction with full transcript preservation, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
 
 ## Git
 

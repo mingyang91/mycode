@@ -88,7 +88,13 @@ private def resumeWithPendingSteers (state : State) : State :=
 
 private def abortPendingTools (state : State) : State :=
   let completed := finishPendingTools state "Tool execution was cancelled before a result was observed."
-  { completed with phase := .idle, pendingCalls := #[], currentCall := 0, pendingSteers := #[] }
+  { completed with
+    phase := .idle
+    pendingCalls := #[]
+    currentCall := 0
+    pendingSteers := #[]
+    compaction := { state.compaction with pending? := none }
+  }
 
 private def requireIdle (state : State) (action : String) : Except String Unit :=
   match state.phase with
@@ -100,6 +106,29 @@ private def requireCallId (expected : String) (received? : Option String) : Exce
   | some received =>
     if received == expected then pure () else throw "event call id does not match the active call"
   | none => throw "event is missing callId"
+
+private def compactionCut? (state : State) : Option Nat :=
+  let userIndices := (List.range state.messages.size).filter fun index =>
+    match state.messages[index]? with
+    | some message => message.role == "user"
+    | none => false
+  match userIndices.reverse with
+  | _latest :: secondLatest :: _ =>
+    if secondLatest > state.compaction.firstKeptMessage then some secondLatest else none
+  | _ => none
+
+private def compactionInputTokens (state : State) (event : Event) : Nat :=
+  if event.inputTokens > 0 then event.inputTokens else state.compaction.lastInputTokens
+
+private def validateCompactionInstructions (instructions? : Option String) : Except String Unit := do
+  match instructions? with
+  | some instructions =>
+    if instructions.length > 1000 then throw "compaction instructions exceed 1000 characters"
+  | none => pure ()
+
+private def validateCompactionSummary (summary : String) : Except String Unit := do
+  if summary.trimAscii.isEmpty then throw "compaction summary must not be empty"
+  if summary.length > 65536 then throw "compaction summary exceeds 65536 characters"
 
 /-- The only business decider. It mutates no external system: Rust realizes each emitted effect
 and supplies another event with the observed result. -/
@@ -131,6 +160,55 @@ public def transition (state : State) (event : Event) : Except String (State × 
       validateTodoPhases event.todos
       pure ({ state with todos := event.todos }, #[])
     | _ => throw "cannot replace todos while the agent is running"
+  | "start_compaction" =>
+    let continueAfter ← match state.phase with
+      | .idle => pure false
+      | .waitingModel => pure true
+      | _ => throw s!"cannot compact while the agent is {state.phase.label}"
+    validateCompactionInstructions event.text?
+    match compactionCut? state with
+    | none => throw "not enough uncompacted history to compact"
+    | some firstKeptMessage =>
+      let pending : PendingCompaction := {
+        firstKeptMessage
+        tokensBefore := compactionInputTokens state event
+        instructions? := event.text?
+        automatic := event.automatic
+        continueAfter
+      }
+      pure ({ state with
+        phase := .waitingCompaction
+        compaction := { state.compaction with pending? := some pending }
+      }, #[Effect.requestCompaction])
+  | "compaction_completed" =>
+    match state.phase, state.compaction.pending?, event.content? with
+    | .waitingCompaction, some pending, some summary =>
+      validateCompactionSummary summary
+      let compaction : CompactionState := {
+        revision := state.compaction.revision + 1
+        summary
+        firstKeptMessage := pending.firstKeptMessage
+        tokensBefore := pending.tokensBefore
+        lastInputTokens := 0
+        pending? := none
+      }
+      if pending.continueAfter then
+        pure ({ state with phase := .waitingModel, compaction }, #[Effect.requestModel])
+      else
+        pure ({ state with phase := .idle, compaction }, #[])
+    | .waitingCompaction, some _, none => throw "compaction_completed event is missing content"
+    | .waitingCompaction, none, _ => throw "compaction completed without pending state"
+    | _, _, _ => throw "compaction_completed arrived without active compaction"
+  | "compaction_failed" =>
+    match state.phase, state.compaction.pending? with
+    | .waitingCompaction, some pending =>
+      let compaction := { state.compaction with lastInputTokens := 0, pending? := none }
+      if pending.continueAfter then
+        pure ({ state with phase := .waitingModel, compaction }, #[Effect.requestModel])
+      else
+        pure ({ state with phase := .idle, compaction }, #[])
+    | .waitingCompaction, none => throw "compaction failed without pending state"
+    | _, _ => throw "compaction_failed arrived without active compaction"
   | "submit" =>
     requireIdle state "submit a prompt"
     match event.text? with
@@ -152,12 +230,15 @@ public def transition (state : State) (event : Event) : Except String (State × 
         | .waitingModel => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
         | .waitingApproval _ => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
         | .waitingPlanReview => throw "cannot steer while a plan is awaiting review"
+        | .waitingCompaction => throw "cannot steer while compaction is running"
     | none => throw "steer event is missing text"
   | "model_completed" =>
     match state.phase with
     | .waitingModel =>
       let content := event.content?.getD ""
-      let withAssistant := appendMessage state {
+      let withAssistant := appendMessage { state with
+        compaction := { state.compaction with lastInputTokens := event.inputTokens }
+      } {
         role := "assistant"
         content
         toolCalls := event.toolCalls
