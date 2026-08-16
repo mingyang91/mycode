@@ -27,5 +27,6 @@ serde_json.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true

@@ -16,7 +16,8 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - `/plan <goal>` starts read-only planning. The model updates todos and submits a Markdown plan through the built-in `plan` tool; the TUI lets the user approve, refine, cancel, or edit it with `$VISUAL`/`$EDITOR`. `/todo` round-trips the same canonical todo state through a bounded Markdown editor.
 - Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
 - The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
-- Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights text and copies the bounded selection through OSC 52 on release; a click without a drag clears selection without writing to the clipboard.
+- Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights and copies through OSC 52; double-click selects a code word, `Ctrl`+double-click selects one visual line, and triple-click selects the contiguous paragraph block. Copied text excludes rounded box borders, and a click without a drag leaves the clipboard unchanged.
+- The input editor keeps a Unicode grapheme cursor and a cursor-following wrapped viewport. `Left`/`Right` move by grapheme; `Alt`/`Ctrl` plus arrows and `Alt+B`/`Alt+F` move by code word; `Ctrl+B`/`Ctrl+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, `Delete`, `Ctrl+W`, and `Alt+Backspace` provide readline-style editing.
 
 ## Lean rules
 

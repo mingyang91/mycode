@@ -1131,6 +1131,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]
