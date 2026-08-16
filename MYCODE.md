@@ -14,7 +14,8 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - Steer belongs to the main Lean state, unlike the independent BTW sidechain. A steer replaces an in-flight model request; during a tool it is persisted until the current result is known, then Lean synthesizes results for every skipped tool before appending the new user instruction.
 - Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
 - The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
-- Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights text and copies the bounded selection through OSC 52 on release; a click without a drag clears selection without writing to the clipboard.
+- Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights and copies through OSC 52; double-click selects a code word, `Ctrl`+double-click selects one visual line, and triple-click selects the contiguous paragraph block. Copied text excludes rounded box borders, and a click without a drag leaves the clipboard unchanged.
+- The input editor keeps a Unicode grapheme cursor and a cursor-following wrapped viewport. `Left`/`Right` move by grapheme; `Alt`/`Ctrl` plus arrows and `Alt+B`/`Alt+F` move by code word; `Ctrl+B`/`Ctrl+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, `Delete`, `Ctrl+W`, and `Alt+Backspace` provide readline-style editing.
 
 ## Lean rules
 

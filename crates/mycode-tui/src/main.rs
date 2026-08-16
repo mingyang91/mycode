@@ -6,7 +6,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -40,7 +40,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,8 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 const CORE_PROTOCOL_VERSION: u64 = 2;
@@ -2168,6 +2169,7 @@ fn build_transcript_lines(
     lines
 }
 const MAX_SELECTION_BYTES: usize = 1024 * 1024;
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SelectionPoint {
@@ -2251,6 +2253,12 @@ impl TextSelection {
         true
     }
 }
+#[derive(Clone, Copy, Debug)]
+struct ClickTracker {
+    point: SelectionPoint,
+    at: Instant,
+    count: u8,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum MouseAction {
@@ -2302,9 +2310,329 @@ fn text_between_columns(line: &str, start: usize, end: usize) -> String {
     }
     result
 }
+fn is_pure_box_border(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '│' | '┃'
+                        | '║'
+                        | '╭'
+                        | '╮'
+                        | '╰'
+                        | '╯'
+                        | '─'
+                        | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                )
+        })
+}
+
+fn selection_content_span(line: &str) -> Option<(usize, usize)> {
+    if line.trim().is_empty() || is_pure_box_border(line) {
+        return None;
+    }
+    let mut start = 0_usize;
+    if let Some(first) = line.chars().next()
+        && matches!(first, '│' | '┃' | '║')
+    {
+        start = UnicodeWidthChar::width(first).unwrap_or(0);
+        let after_border = &line[first.len_utf8()..];
+        if after_border.starts_with(' ') {
+            start = start.saturating_add(1);
+        }
+    }
+
+    let trimmed = line.trim_end();
+    let without_trailing_border = trimmed
+        .char_indices()
+        .next_back()
+        .filter(|(_, character)| matches!(character, '│' | '┃' | '║'))
+        .map_or(trimmed, |(index, _)| &trimmed[..index]);
+    let end = UnicodeWidthStr::width(without_trailing_border.trim_end());
+    (start < end).then_some((start, end))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputClass {
+    Whitespace,
+    Identifier,
+    Punctuation,
+}
+
+fn input_class(grapheme: &str) -> InputClass {
+    let first = grapheme.chars().next();
+    if first.is_some_and(char::is_whitespace) {
+        InputClass::Whitespace
+    } else if first.is_some_and(|character| character.is_alphanumeric() || character == '_') {
+        InputClass::Identifier
+    } else {
+        InputClass::Punctuation
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct InputBuffer {
+    text: String,
+    cursor: usize,
+}
+
+impl InputBuffer {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn insert(&mut self, character: char) {
+        self.text.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    fn backspace(&mut self) -> bool {
+        let previous = self.previous_grapheme_boundary();
+        if previous == self.cursor {
+            return false;
+        }
+        self.text.drain(previous..self.cursor);
+        self.cursor = previous;
+        true
+    }
+
+    fn delete(&mut self) -> bool {
+        let next = self.next_grapheme_boundary();
+        if next == self.cursor {
+            return false;
+        }
+        self.text.drain(self.cursor..next);
+        true
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.previous_grapheme_boundary();
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = self.next_grapheme_boundary();
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    fn move_line_start(&mut self) {
+        self.cursor = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+
+    fn move_line_end(&mut self) {
+        self.cursor = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| self.cursor + index);
+    }
+
+    fn move_word_left(&mut self) {
+        self.cursor = self.previous_word_boundary();
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor = self.next_word_boundary();
+    }
+
+    fn delete_word_left(&mut self) -> bool {
+        let previous = self.previous_word_boundary();
+        if previous == self.cursor {
+            return false;
+        }
+        self.text.drain(previous..self.cursor);
+        self.cursor = previous;
+        true
+    }
+
+    fn delete_word_right(&mut self) -> bool {
+        let next = self.next_word_boundary();
+        if next == self.cursor {
+            return false;
+        }
+        self.text.drain(self.cursor..next);
+        true
+    }
+
+    fn previous_grapheme_boundary(&self) -> usize {
+        self.text[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(self.cursor, |(index, _)| index)
+    }
+
+    fn next_grapheme_boundary(&self) -> usize {
+        self.text[self.cursor..]
+            .graphemes(true)
+            .next()
+            .map_or(self.cursor, |grapheme| self.cursor + grapheme.len())
+    }
+
+    fn previous_word_boundary(&self) -> usize {
+        let mut position = self.cursor;
+        while let Some((start, grapheme)) = self.grapheme_before(position) {
+            if input_class(grapheme) != InputClass::Whitespace {
+                break;
+            }
+            position = start;
+        }
+        let Some((start, grapheme)) = self.grapheme_before(position) else {
+            return position;
+        };
+        let class = input_class(grapheme);
+        position = start;
+        while let Some((start, grapheme)) = self.grapheme_before(position) {
+            if input_class(grapheme) != class {
+                break;
+            }
+            position = start;
+        }
+        position
+    }
+
+    fn next_word_boundary(&self) -> usize {
+        let mut position = self.cursor;
+        while let Some(grapheme) = self.grapheme_at(position) {
+            if input_class(grapheme) != InputClass::Whitespace {
+                break;
+            }
+            position += grapheme.len();
+        }
+        let Some(grapheme) = self.grapheme_at(position) else {
+            return position;
+        };
+        let class = input_class(grapheme);
+        while let Some(grapheme) = self.grapheme_at(position) {
+            if input_class(grapheme) != class {
+                break;
+            }
+            position += grapheme.len();
+        }
+        position
+    }
+
+    fn grapheme_before(&self, position: usize) -> Option<(usize, &str)> {
+        self.text[..position].grapheme_indices(true).next_back()
+    }
+
+    fn grapheme_at(&self, position: usize) -> Option<&str> {
+        self.text[position..].graphemes(true).next()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InputLayout {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+impl InputLayout {
+    fn new(input: &InputBuffer, width: u16) -> Self {
+        let width = usize::from(width.max(1));
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut row = 0_usize;
+        let mut column = 0_usize;
+        let mut cursor = None;
+
+        for (index, grapheme) in input.text.grapheme_indices(true) {
+            if grapheme == "\n" {
+                if column >= width {
+                    lines.push(std::mem::take(&mut line));
+                    row += 1;
+                    column = 0;
+                }
+                if input.cursor == index {
+                    cursor = Some((row, column));
+                }
+                lines.push(std::mem::take(&mut line));
+                row += 1;
+                column = 0;
+                continue;
+            }
+
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if grapheme_width > 0 && column > 0 && column.saturating_add(grapheme_width) > width {
+                lines.push(std::mem::take(&mut line));
+                row += 1;
+                column = 0;
+            }
+            if input.cursor == index {
+                cursor = Some((row, column));
+            }
+            line.push_str(grapheme);
+            column = column.saturating_add(grapheme_width);
+        }
+
+        if input.cursor == input.text.len() {
+            if column >= width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                row += 1;
+                column = 0;
+            }
+            cursor = Some((row, column));
+        }
+        lines.push(line);
+        let (cursor_row, cursor_column) = cursor.unwrap_or((0, 0));
+        Self {
+            lines,
+            cursor_row,
+            cursor_column,
+        }
+    }
+
+    fn render_height(&self, available_height: u16) -> u16 {
+        let desired = u16::try_from(self.lines.len().saturating_add(2)).unwrap_or(u16::MAX);
+        desired.min(available_height.max(3)).max(3)
+    }
+
+    fn visible_start(&self, rows: usize) -> usize {
+        self.cursor_row
+            .saturating_add(1)
+            .saturating_sub(rows.max(1))
+    }
+
+    fn visible_text(&self, start: usize, rows: usize) -> Text<'static> {
+        Text::from(
+            self.lines
+                .iter()
+                .skip(start)
+                .take(rows)
+                .cloned()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
 
 struct App {
-    input: String,
+    input: InputBuffer,
     slash_selection: usize,
     slash_menu_dismissed: bool,
     status: String,
@@ -2318,6 +2646,8 @@ struct App {
     selection_region: Option<SelectionRegion>,
     selection_lines: Vec<String>,
     text_selection: Option<TextSelection>,
+    last_click: Option<ClickTracker>,
+    pending_click_selection: bool,
     transcript_revision: u64,
     transcript_details_expanded: bool,
     transcript_layout: Option<TranscriptLayoutCache>,
@@ -2328,7 +2658,7 @@ struct App {
 impl App {
     fn new(snapshot: CoreSnapshot) -> Self {
         Self {
-            input: String::new(),
+            input: InputBuffer::default(),
             slash_selection: 0,
             slash_menu_dismissed: false,
             status: "Ready".to_owned(),
@@ -2342,6 +2672,8 @@ impl App {
             selection_region: None,
             selection_lines: Vec::new(),
             text_selection: None,
+            last_click: None,
+            pending_click_selection: false,
             transcript_revision: 0,
             transcript_details_expanded: false,
             transcript_layout: None,
@@ -2350,7 +2682,7 @@ impl App {
         }
     }
     fn slash_candidate_count(&self) -> usize {
-        slash_command_candidates(&self.input).count()
+        slash_command_candidates(self.input.as_str()).count()
     }
 
     fn slash_menu_visible(&self) -> bool {
@@ -2361,15 +2693,38 @@ impl App {
         self.slash_selection = 0;
         self.slash_menu_dismissed = false;
     }
+    fn set_input(&mut self, text: String) {
+        self.input.set_text(text);
+        self.input_changed();
+    }
 
     fn push_input_character(&mut self, character: char) {
-        self.input.push(character);
+        self.input.insert(character);
         self.input_changed();
     }
 
     fn pop_input_character(&mut self) {
-        self.input.pop();
-        self.input_changed();
+        if self.input.backspace() {
+            self.input_changed();
+        }
+    }
+
+    fn delete_input_character(&mut self) {
+        if self.input.delete() {
+            self.input_changed();
+        }
+    }
+
+    fn delete_input_word_left(&mut self) {
+        if self.input.delete_word_left() {
+            self.input_changed();
+        }
+    }
+
+    fn delete_input_word_right(&mut self) {
+        if self.input.delete_word_right() {
+            self.input_changed();
+        }
     }
 
     fn clear_input(&mut self) {
@@ -2391,18 +2746,17 @@ impl App {
     }
 
     fn complete_selected_slash_command(&mut self) -> bool {
-        let Some(spec) = slash_command_candidates(&self.input)
+        let Some(spec) = slash_command_candidates(self.input.as_str())
             .nth(self.slash_selection)
             .copied()
         else {
             return false;
         };
-        self.input.clear();
-        self.input.push('/');
-        self.input.push_str(spec.name);
+        let mut completed = format!("/{}", spec.name);
         if spec.takes_arguments {
-            self.input.push(' ');
+            completed.push(' ');
         }
+        self.input.set_text(completed);
         self.slash_selection = 0;
         self.slash_menu_dismissed = true;
         true
@@ -2418,6 +2772,7 @@ impl App {
     }
     fn clear_text_selection(&mut self) {
         self.text_selection = None;
+        self.pending_click_selection = false;
     }
 
     fn update_selection_content(&mut self, region: Option<SelectionRegion>, text: &Text<'_>) {
@@ -2429,6 +2784,149 @@ impl App {
         self.selection_lines
             .extend(text.lines.iter().map(Line::to_string));
     }
+    fn register_click(&mut self, point: SelectionPoint, now: Instant) -> u8 {
+        let count = self
+            .last_click
+            .filter(|last| {
+                last.point == point
+                    && now
+                        .checked_duration_since(last.at)
+                        .is_some_and(|elapsed| elapsed <= MULTI_CLICK_INTERVAL)
+            })
+            .map_or(1, |last| if last.count >= 3 { 1 } else { last.count + 1 });
+        self.last_click = Some(ClickTracker {
+            point,
+            at: now,
+            count,
+        });
+        count
+    }
+
+    fn word_selection_at(&self, point: SelectionPoint) -> Option<TextSelection> {
+        let region = self.selection_region?;
+        let line_index = usize::from(point.row.checked_sub(region.top)?);
+        let line = self.selection_lines.get(line_index)?;
+        let clicked_column = point.column.checked_sub(region.left)?;
+        let (content_start, content_end) = selection_content_span(line)?;
+        if usize::from(clicked_column) < content_start || usize::from(clicked_column) >= content_end
+        {
+            return None;
+        }
+        let mut column = 0_u16;
+        let mut spans = Vec::new();
+        for grapheme in line.graphemes(true) {
+            let width = u16::try_from(UnicodeWidthStr::width(grapheme)).unwrap_or(u16::MAX);
+            if width == 0 {
+                continue;
+            }
+            let end = column.saturating_add(width);
+            spans.push((column, end, input_class(grapheme)));
+            column = end;
+        }
+        let clicked = spans
+            .iter()
+            .position(|(start, end, _)| clicked_column >= *start && clicked_column < *end)?;
+        let class = spans[clicked].2;
+        let mut first = clicked;
+        while first > 0 && spans[first - 1].2 == class {
+            first -= 1;
+        }
+        let mut last = clicked;
+        while last + 1 < spans.len() && spans[last + 1].2 == class {
+            last += 1;
+        }
+        let start = region.left.saturating_add(
+            u16::try_from(usize::from(spans[first].0).max(content_start)).unwrap_or(u16::MAX),
+        );
+        let end = region
+            .left
+            .saturating_add(
+                u16::try_from(usize::from(spans[last].1).min(content_end)).unwrap_or(u16::MAX),
+            )
+            .min(region.right)
+            .saturating_sub(1);
+        Some(TextSelection {
+            anchor: SelectionPoint {
+                row: point.row,
+                column: start,
+            },
+            focus: SelectionPoint {
+                row: point.row,
+                column: end,
+            },
+            dragging: false,
+        })
+    }
+
+    fn line_selection_at(&self, point: SelectionPoint) -> Option<TextSelection> {
+        let region = self.selection_region?;
+        let line_index = usize::from(point.row.checked_sub(region.top)?);
+        let (start, end) = selection_content_span(self.selection_lines.get(line_index)?)?;
+        Some(TextSelection {
+            anchor: SelectionPoint {
+                row: point.row,
+                column: region
+                    .left
+                    .saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
+            },
+            focus: SelectionPoint {
+                row: point.row,
+                column: region
+                    .left
+                    .saturating_add(u16::try_from(end).unwrap_or(u16::MAX))
+                    .min(region.right)
+                    .saturating_sub(1),
+            },
+            dragging: false,
+        })
+    }
+    fn paragraph_selection_at(&self, point: SelectionPoint) -> Option<TextSelection> {
+        let region = self.selection_region?;
+        let clicked = usize::from(point.row.checked_sub(region.top)?);
+        selection_content_span(self.selection_lines.get(clicked)?)?;
+        let mut first = clicked;
+        while first > 0
+            && self
+                .selection_lines
+                .get(first - 1)
+                .and_then(|line| selection_content_span(line))
+                .is_some()
+        {
+            first -= 1;
+        }
+        let mut last = clicked;
+        while self
+            .selection_lines
+            .get(last + 1)
+            .and_then(|line| selection_content_span(line))
+            .is_some()
+        {
+            last += 1;
+        }
+        let (first_start, _) = selection_content_span(self.selection_lines.get(first)?)?;
+        let (_, last_end) = selection_content_span(self.selection_lines.get(last)?)?;
+        Some(TextSelection {
+            anchor: SelectionPoint {
+                row: region
+                    .top
+                    .saturating_add(u16::try_from(first).unwrap_or(u16::MAX)),
+                column: region
+                    .left
+                    .saturating_add(u16::try_from(first_start).unwrap_or(u16::MAX)),
+            },
+            focus: SelectionPoint {
+                row: region
+                    .top
+                    .saturating_add(u16::try_from(last).unwrap_or(u16::MAX)),
+                column: region
+                    .left
+                    .saturating_add(u16::try_from(last_end).unwrap_or(u16::MAX))
+                    .min(region.right)
+                    .saturating_sub(1),
+            },
+            dragging: false,
+        })
+    }
 
     fn completed_selection_action(&mut self) -> MouseAction {
         let (Some(region), Some(selection)) = (self.selection_region, self.text_selection) else {
@@ -2436,26 +2934,36 @@ impl App {
         };
         let (start, end) = selection.ordered();
         let mut text = String::new();
+        let mut selected_rows = 0_usize;
         for row in start.row..=end.row {
             let line_index = usize::from(row.saturating_sub(region.top));
             let line = self
                 .selection_lines
                 .get(line_index)
                 .map_or("", String::as_str);
+            if is_pure_box_border(line) {
+                continue;
+            }
+            let content_span = selection_content_span(line);
             let start_column = if row == start.row {
-                start.column.saturating_sub(region.left)
+                usize::from(start.column.saturating_sub(region.left))
             } else {
-                0
+                content_span.map_or(0, |(content_start, _)| content_start)
             };
             let end_column = if row == end.row {
-                end.column.saturating_sub(region.left).saturating_add(1)
+                usize::from(end.column.saturating_sub(region.left).saturating_add(1))
             } else {
-                region.right.saturating_sub(region.left)
+                content_span.map_or(0, |(_, content_end)| content_end)
             };
-            let selected =
-                text_between_columns(line, usize::from(start_column), usize::from(end_column));
+            let selected = content_span.map_or("".to_owned(), |(content_start, content_end)| {
+                text_between_columns(
+                    line,
+                    start_column.max(content_start),
+                    end_column.min(content_end),
+                )
+            });
             let selected = selected.trim_end();
-            let separator_bytes = usize::from(row != start.row);
+            let separator_bytes = usize::from(selected_rows > 0);
             if text
                 .len()
                 .saturating_add(separator_bytes)
@@ -2464,10 +2972,11 @@ impl App {
             {
                 return MouseAction::SelectionTooLarge;
             }
-            if row != start.row {
+            if selected_rows > 0 {
                 text.push('\n');
             }
             text.push_str(selected);
+            selected_rows += 1;
         }
         if text.trim().is_empty() {
             self.clear_text_selection();
@@ -2478,16 +2987,22 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) -> MouseAction {
+        self.handle_mouse_at(event, Instant::now())
+    }
+
+    fn handle_mouse_at(&mut self, event: MouseEvent, now: Instant) -> MouseAction {
         let point = SelectionPoint::from_mouse(event);
         let over_transcript = self
             .selection_region
             .is_some_and(|region| point.row >= region.top && point.row < region.bottom);
         match event.kind {
             MouseEventKind::ScrollUp if over_transcript => {
+                self.last_click = None;
                 self.clear_text_selection();
                 MouseAction::Scroll(-1)
             }
             MouseEventKind::ScrollDown if over_transcript => {
+                self.last_click = None;
                 self.clear_text_selection();
                 MouseAction::Scroll(1)
             }
@@ -2496,12 +3011,29 @@ impl App {
                     return MouseAction::None;
                 };
                 if !region.contains(point) {
+                    self.last_click = None;
                     let changed = self.text_selection.take().is_some();
+                    self.pending_click_selection = false;
                     return if changed {
                         MouseAction::Redraw
                     } else {
                         MouseAction::None
                     };
+                }
+                let click_count = self.register_click(point, now);
+                let multi_click_selection = if click_count >= 3 {
+                    self.paragraph_selection_at(point)
+                } else if click_count == 2 && event.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.line_selection_at(point)
+                } else if click_count == 2 {
+                    self.word_selection_at(point)
+                } else {
+                    None
+                };
+                if let Some(selection) = multi_click_selection {
+                    self.text_selection = Some(selection);
+                    self.pending_click_selection = true;
+                    return MouseAction::Redraw;
                 }
                 if event.modifiers.contains(KeyModifiers::CONTROL)
                     && let Some(selection) = &mut self.text_selection
@@ -2510,6 +3042,7 @@ impl App {
                     selection.dragging = true;
                     return MouseAction::Redraw;
                 }
+                self.pending_click_selection = false;
                 self.text_selection = Some(TextSelection {
                     anchor: point,
                     focus: point,
@@ -2526,10 +3059,16 @@ impl App {
                 if !selection.dragging {
                     return MouseAction::None;
                 }
+                self.last_click = None;
+                self.pending_click_selection = false;
                 selection.focus = region.clamp(point);
                 MouseAction::Redraw
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.pending_click_selection {
+                    self.pending_click_selection = false;
+                    return self.completed_selection_action();
+                }
                 let (Some(region), Some(selection)) =
                     (self.selection_region, &mut self.text_selection)
                 else {
@@ -2999,7 +3538,8 @@ async fn tui_loop(
                     return Ok(());
                 };
                 match event? {
-                    CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    CrosstermEvent::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                         if pending_scroll != 0 {
                             app.scroll_delta(pending_scroll);
                             pending_scroll = 0;
@@ -3017,8 +3557,7 @@ async fn tui_loop(
                                     match active_runtime.steer.send(text) {
                                         Ok(()) => app.status = "Steering…".to_owned(),
                                         Err(error) => {
-                                            app.input = error.0;
-                                            app.input_changed();
+                                            app.set_input(error.0);
                                             app.status =
                                                 "Task settled before steer arrived · press Enter to send"
                                                     .to_owned();
@@ -3165,10 +3704,12 @@ async fn tui_loop(
 }
 
 fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if control && matches!(key.code, KeyCode::Char('c')) {
         return KeyAction::Quit;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o')) {
+    if control && matches!(key.code, KeyCode::Char('o')) {
         app.toggle_transcript_details();
         return KeyAction::None;
     }
@@ -3179,6 +3720,86 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
             _ => {}
         }
     }
+
+    let input_active = app.approval.is_none() || !app.input.is_empty();
+    if input_active {
+        match key.code {
+            KeyCode::Left if alt || control => {
+                app.input.move_word_left();
+                return KeyAction::None;
+            }
+            KeyCode::Right if alt || control => {
+                app.input.move_word_right();
+                return KeyAction::None;
+            }
+            KeyCode::Left => {
+                app.input.move_left();
+                return KeyAction::None;
+            }
+            KeyCode::Right => {
+                app.input.move_right();
+                return KeyAction::None;
+            }
+            KeyCode::Home if control => {
+                app.input.move_start();
+                return KeyAction::None;
+            }
+            KeyCode::End if control => {
+                app.input.move_end();
+                return KeyAction::None;
+            }
+            KeyCode::Home if !app.input.is_empty() => {
+                app.input.move_line_start();
+                return KeyAction::None;
+            }
+            KeyCode::End if !app.input.is_empty() => {
+                app.input.move_line_end();
+                return KeyAction::None;
+            }
+            KeyCode::Char('b') if control => {
+                app.input.move_left();
+                return KeyAction::None;
+            }
+            KeyCode::Char('f') if control => {
+                app.input.move_right();
+                return KeyAction::None;
+            }
+            KeyCode::Char('b') if alt => {
+                app.input.move_word_left();
+                return KeyAction::None;
+            }
+            KeyCode::Char('f') if alt => {
+                app.input.move_word_right();
+                return KeyAction::None;
+            }
+            KeyCode::Char('a') if control => {
+                app.input.move_line_start();
+                return KeyAction::None;
+            }
+            KeyCode::Char('e') if control => {
+                app.input.move_line_end();
+                return KeyAction::None;
+            }
+            KeyCode::Char('w') if control => {
+                app.delete_input_word_left();
+                return KeyAction::None;
+            }
+            KeyCode::Char('d') if alt => {
+                app.delete_input_word_right();
+                return KeyAction::None;
+            }
+            KeyCode::Backspace if alt || control => {
+                app.delete_input_word_left();
+                return KeyAction::None;
+            }
+            KeyCode::Delete => {
+                app.delete_input_character();
+                return KeyAction::None;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Up => {
             app.scroll_up(1);
@@ -3232,8 +3853,8 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
     match key.code {
-        KeyCode::Enter if !app.input.trim().is_empty() => {
-            let parsed = parse_submission(app.input.clone());
+        KeyCode::Enter if !app.input.as_str().trim().is_empty() => {
+            let parsed = parse_submission(app.input.as_str().to_owned());
             match parsed {
                 Ok(UserSubmission::Command(SlashCommand::Exit)) => {
                     app.clear_input();
@@ -3289,7 +3910,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
             app.clear_input();
             KeyAction::None
         }
-        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(character) if !control => {
             app.push_input_character(character);
             KeyAction::None
         }
@@ -3584,27 +4205,11 @@ async fn cancel_and_wait(active: &mut Option<ActiveRuntime>, app: &mut App) {
     app.status = "Cancelling…".to_owned();
     let _ = active.handle.await;
 }
-fn input_render_height(input: &str, width: u16, available_height: u16) -> u16 {
-    let content_width = usize::from(width.saturating_sub(2)).max(1);
-    let wrapped_lines = input
-        .split('\n')
-        .map(|line| {
-            if line.is_empty() {
-                1
-            } else {
-                textwrap::wrap(line, content_width).len().max(1)
-            }
-        })
-        .sum::<usize>()
-        .max(1);
-    let desired = u16::try_from(wrapped_lines.saturating_add(2)).unwrap_or(u16::MAX);
-    desired.min(available_height.max(3)).max(3)
-}
 fn slash_candidate_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
     let count = app.slash_candidate_count();
     let rows = count.min(max_rows);
     let start = app.slash_selection.saturating_add(1).saturating_sub(rows);
-    slash_command_candidates(&app.input)
+    slash_command_candidates(app.input.as_str())
         .enumerate()
         .skip(start)
         .take(rows)
@@ -3652,11 +4257,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         0
     };
-    let input_height = input_render_height(
-        &app.input,
-        area.width,
-        area.height.saturating_sub(1 + 4 + candidate_height + 1),
-    );
+    let input_layout = InputLayout::new(&app.input, area.width.saturating_sub(2));
+    let input_height =
+        input_layout.render_height(area.height.saturating_sub(1 + 4 + candidate_height + 1));
     let [header, transcript, candidates, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -3738,10 +4341,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         None if app.busy => (" Message · Esc cancel ".to_owned(), COLOR_ACCENT),
         None => (" Message · Enter send ".to_owned(), COLOR_MUTED),
     };
+    let visible_input_rows = usize::from(input.height.saturating_sub(2)).max(1);
+    let input_start = input_layout.visible_start(visible_input_rows);
     frame.render_widget(
-        Paragraph::new(app.input.as_str())
+        Paragraph::new(input_layout.visible_text(input_start, visible_input_rows))
             .style(Style::default().fg(COLOR_TEXT))
-            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3756,6 +4360,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
         input,
     );
+    if app.approval.is_none() || !app.input.is_empty() {
+        let cursor_column = u16::try_from(input_layout.cursor_column).unwrap_or(u16::MAX);
+        let cursor_row =
+            u16::try_from(input_layout.cursor_row.saturating_sub(input_start)).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            input.x.saturating_add(1).saturating_add(cursor_column),
+            input.y.saturating_add(1).saturating_add(cursor_row),
+        ));
+    }
 
     let status_color = if app.status.contains("failed") || app.status.contains("error") {
         COLOR_ERROR
@@ -3819,7 +4432,7 @@ mod tests {
     use std::{
         env, fs,
         path::Path,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use clap::Parser;
@@ -3830,10 +4443,10 @@ mod tests {
 
     use super::{
         App, Args, BtwSidechainStore, COLOR_ACCENT, COLOR_ASSISTANT_BACKGROUND, COLOR_MUTED,
-        COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall, KeyAction,
-        LiveToolOutput, LocalTranscriptEntry, MouseAction, PermissionMode, SelectionPoint,
-        SelectionRegion, SlashCommand, SlashCommandError, TextSelection, ToolOutputStream,
-        ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
+        COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall, InputBuffer,
+        InputLayout, KeyAction, LiveToolOutput, LocalTranscriptEntry, MouseAction, PermissionMode,
+        SelectionPoint, SelectionRegion, SlashCommand, SlashCommandError, TextSelection,
+        ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
         automatically_safe_tool_names, btw_sidechain_path, build_live_tool_lines,
         build_transcript_lines, draw, handle_key, parse_openai_tool_calls, parse_submission,
         startup_permission_mode, text_between_columns,
@@ -3913,6 +4526,156 @@ mod tests {
     }
 
     #[test]
+    fn input_buffer_edits_at_unicode_grapheme_boundaries() {
+        let mut input = InputBuffer::default();
+        input.set_text("a界e\u{301}".to_owned());
+        assert_eq!(input.cursor, input.as_str().len());
+
+        input.move_left();
+        assert_eq!(input.cursor, "a界".len());
+        input.insert('X');
+        assert_eq!(input.as_str(), "a界Xe\u{301}");
+        assert!(input.backspace());
+        assert_eq!(input.as_str(), "a界e\u{301}");
+        input.move_left();
+        assert!(input.delete());
+        assert_eq!(input.as_str(), "ae\u{301}");
+    }
+
+    #[test]
+    fn input_buffer_moves_and_deletes_by_code_word() {
+        let mut input = InputBuffer::default();
+        input.set_text("alpha_beta  中文 :: gamma".to_owned());
+
+        input.move_word_left();
+        assert_eq!(
+            input.cursor,
+            input.as_str().rfind("gamma").expect("gamma must exist")
+        );
+        input.move_word_left();
+        assert_eq!(
+            input.cursor,
+            input.as_str().find("::").expect("separator must exist")
+        );
+        input.move_word_left();
+        assert_eq!(
+            input.cursor,
+            input.as_str().find("中文").expect("word must exist")
+        );
+        input.move_start();
+        input.move_word_right();
+        assert_eq!(input.cursor, "alpha_beta".len());
+        input.move_end();
+        assert!(input.delete_word_left());
+        assert_eq!(input.as_str(), "alpha_beta  中文 :: ");
+    }
+
+    #[test]
+    fn cursor_keybindings_insert_and_delete_away_from_the_tail() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.set_input("one two".to_owned());
+        app.max_scroll = 20;
+        app.scroll_offset = 20;
+
+        let _ = handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &mut app);
+        assert_eq!(app.input.cursor, "one ".len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+            &mut app,
+        );
+        assert_eq!(app.input.as_str(), "one Xtwo");
+        let _ = handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.input.cursor, 0);
+        assert_eq!(app.scroll_offset, 20);
+        let _ = handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.input.as_str(), "ne Xtwo");
+        let _ = handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut app);
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.as_str(), "ne ");
+    }
+    #[test]
+    fn alt_and_control_navigation_shortcuts_move_the_cursor() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.set_input("one two".to_owned());
+
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, "one ".len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, app.input.as_str().len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, "one tw".len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, app.input.as_str().len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, "one ".len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, app.input.as_str().len());
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, 0);
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut app,
+        );
+        assert_eq!(app.input.cursor, app.input.as_str().len());
+    }
+
+    #[test]
+    fn input_layout_wraps_text_and_places_full_line_cursor_on_next_row() {
+        let mut input = InputBuffer::default();
+        input.set_text("ab界cd".to_owned());
+        let layout = InputLayout::new(&input, 4);
+        assert_eq!(layout.lines, vec!["ab界".to_owned(), "cd".to_owned()]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 2));
+
+        input.set_text("ab界".to_owned());
+        let layout = InputLayout::new(&input, 4);
+        assert_eq!(layout.lines, vec!["ab界".to_owned(), String::new()]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        assert_eq!(layout.visible_start(1), 1);
+    }
+
+    #[test]
+    fn draw_places_terminal_cursor_at_input_buffer_cursor() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.set_input("abcdef".to_owned());
+        app.input.move_left();
+        app.input.move_left();
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("input cursor frame must draw");
+
+        let cursor = terminal.backend().cursor_position();
+        assert_eq!(cursor.x, 5);
+        assert_eq!(cursor.y, 9);
+    }
+
+    #[test]
     fn parses_supported_slash_commands_and_literal_escape() {
         assert_eq!(
             parse_submission("/btw why this design?".to_owned()),
@@ -3946,7 +4709,7 @@ mod tests {
     #[test]
     fn slash_candidates_filter_and_tab_complete() {
         let mut app = App::new(CoreSnapshot::default());
-        app.input = "/".to_owned();
+        app.set_input("/".to_owned());
         assert!(app.slash_menu_visible());
         assert_eq!(app.slash_candidate_count(), 3);
 
@@ -3955,20 +4718,20 @@ mod tests {
         assert_eq!(app.slash_selection, 1);
         let action = handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, KeyAction::None));
-        assert_eq!(app.input, "/exit");
+        assert_eq!(app.input.as_str(), "/exit");
         assert!(!app.slash_menu_visible());
 
-        app.input = "/b".to_owned();
+        app.set_input("/b".to_owned());
         app.input_changed();
         assert_eq!(app.slash_candidate_count(), 1);
         let _ = handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.input, "/btw ");
+        assert_eq!(app.input.as_str(), "/btw ");
         assert_eq!(app.slash_candidate_count(), 0);
 
-        app.input = "//".to_owned();
+        app.set_input("//".to_owned());
         app.input_changed();
         assert!(!app.slash_menu_visible());
-        app.input = "/btw question".to_owned();
+        app.set_input("/btw question".to_owned());
         app.input_changed();
         assert!(!app.slash_menu_visible());
     }
@@ -3976,7 +4739,7 @@ mod tests {
     #[test]
     fn slash_navigation_precedes_scrolling() {
         let mut app = App::new(CoreSnapshot::default());
-        app.input = "/".to_owned();
+        app.set_input("/".to_owned());
         app.max_scroll = 20;
         app.scroll_offset = 20;
         app.follow_tail = true;
@@ -3994,7 +4757,7 @@ mod tests {
     #[test]
     fn busy_escape_cancels_before_dismissing_slash_menu() {
         let mut app = App::new(CoreSnapshot::default());
-        app.input = "/".to_owned();
+        app.set_input("/".to_owned());
         app.busy = true;
 
         assert!(matches!(
@@ -4002,7 +4765,7 @@ mod tests {
             KeyAction::Cancel
         ));
         assert!(app.slash_menu_visible());
-        assert_eq!(app.input, "/");
+        assert_eq!(app.input.as_str(), "/");
 
         app.busy = false;
         assert!(matches!(
@@ -4010,13 +4773,13 @@ mod tests {
             KeyAction::None
         ));
         assert!(!app.slash_menu_visible());
-        assert_eq!(app.input, "/");
+        assert_eq!(app.input.as_str(), "/");
     }
 
     #[test]
     fn slash_candidate_menu_renders_command_usage_and_help() {
         let mut app = App::new(CoreSnapshot::default());
-        app.input = "/".to_owned();
+        app.set_input("/".to_owned());
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
         terminal
@@ -4050,7 +4813,7 @@ mod tests {
     #[test]
     fn enter_dispatches_btw_and_exit_locally() {
         let mut app = App::new(CoreSnapshot::default());
-        app.input = "/btw side question".to_owned();
+        app.set_input("/btw side question".to_owned());
         match handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app) {
             KeyAction::Btw(question) => assert_eq!(question, "side question"),
             _ => panic!("/btw must dispatch as a local BTW action"),
@@ -4058,7 +4821,7 @@ mod tests {
         assert!(app.input.is_empty());
 
         app.busy = true;
-        app.input = "/exit".to_owned();
+        app.set_input("/exit".to_owned());
         assert!(matches!(
             handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
             KeyAction::Quit
@@ -4072,7 +4835,7 @@ mod tests {
             ..CoreSnapshot::default()
         });
         model_app.busy = true;
-        model_app.input = "Use the safer plan".to_owned();
+        model_app.set_input("Use the safer plan".to_owned());
         match handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut model_app,
@@ -4091,7 +4854,7 @@ mod tests {
             name: "write".to_owned(),
             arguments: serde_json::json!({}),
         });
-        approval_app.input = "/steer do not write".to_owned();
+        approval_app.set_input("/steer do not write".to_owned());
         match handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut approval_app,
@@ -4108,12 +4871,12 @@ mod tests {
             ..CoreSnapshot::default()
         });
         app.busy = true;
-        app.input = "Continue the main task".to_owned();
+        app.set_input("Continue the main task".to_owned());
         assert!(matches!(
             handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
             KeyAction::None
         ));
-        assert_eq!(app.input, "Continue the main task");
+        assert_eq!(app.input.as_str(), "Continue the main task");
     }
 
     #[test]
@@ -4708,28 +5471,28 @@ mod tests {
             bottom: 7,
         });
         app.selection_lines = vec![
-            "alpha beta".to_owned(),
-            "gamma delta".to_owned(),
-            "third".to_owned(),
+            "│ alpha beta  │".to_owned(),
+            "│ gamma delta │".to_owned(),
+            "│ third       │".to_owned(),
         ];
 
         let down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
+            column: 4,
             row: 4,
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(app.handle_mouse(down), MouseAction::Redraw);
         let drag = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 6,
+            column: 8,
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(app.handle_mouse(drag), MouseAction::Redraw);
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
-            column: 6,
+            column: 8,
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
@@ -4748,10 +5511,10 @@ mod tests {
             right: 14,
             bottom: 7,
         });
-        app.selection_lines = vec!["alpha beta".to_owned()];
+        app.selection_lines = vec!["│ alpha beta │".to_owned()];
         let down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 3,
+            column: 4,
             row: 4,
             modifiers: KeyModifiers::NONE,
         };
@@ -4763,6 +5526,116 @@ mod tests {
         assert_eq!(app.handle_mouse(down), MouseAction::Redraw);
         assert_eq!(app.handle_mouse(up), MouseAction::Redraw);
         assert!(app.text_selection.is_none());
+    }
+    #[test]
+    fn double_click_selects_word_control_double_click_selects_line_and_triple_click_selects_paragraph()
+     {
+        let mut app = App::new(CoreSnapshot::default());
+        app.selection_region = Some(SelectionRegion {
+            left: 2,
+            top: 4,
+            right: 24,
+            bottom: 7,
+        });
+        app.selection_lines = vec!["│ alpha beta gamma  │".to_owned()];
+        let point = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..point
+        };
+        let start = Instant::now();
+
+        assert_eq!(app.handle_mouse_at(point, start), MouseAction::Redraw);
+        assert_eq!(
+            app.handle_mouse_at(release, start + Duration::from_millis(10)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse_at(point, start + Duration::from_millis(100)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.handle_mouse_at(release, start + Duration::from_millis(110)),
+            MouseAction::Copy("beta".to_owned())
+        );
+
+        let mut line_app = App::new(CoreSnapshot::default());
+        line_app.selection_region = app.selection_region;
+        line_app.selection_lines = app.selection_lines.clone();
+        assert_eq!(line_app.handle_mouse_at(point, start), MouseAction::Redraw);
+        assert_eq!(
+            line_app.handle_mouse_at(release, start + Duration::from_millis(10)),
+            MouseAction::Redraw
+        );
+        let control_point = MouseEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..point
+        };
+        let control_release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..control_point
+        };
+        assert_eq!(
+            line_app.handle_mouse_at(control_point, start + Duration::from_millis(100)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            line_app.handle_mouse_at(control_release, start + Duration::from_millis(110)),
+            MouseAction::Copy("alpha beta gamma".to_owned())
+        );
+        let mut paragraph_app = App::new(CoreSnapshot::default());
+        paragraph_app.selection_region = Some(SelectionRegion {
+            left: 2,
+            top: 4,
+            right: 24,
+            bottom: 10,
+        });
+        paragraph_app.selection_lines = vec![
+            "╭────────────────────╮".to_owned(),
+            "│ alpha beta         │".to_owned(),
+            "│ gamma delta        │".to_owned(),
+            "╰────────────────────╯".to_owned(),
+            String::new(),
+            "│ other paragraph    │".to_owned(),
+        ];
+        let paragraph_point = MouseEvent {
+            column: 4,
+            row: 5,
+            ..point
+        };
+        let paragraph_release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..paragraph_point
+        };
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_point, start),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_release, start + Duration::from_millis(10)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_point, start + Duration::from_millis(100)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_release, start + Duration::from_millis(110)),
+            MouseAction::Copy("alpha".to_owned())
+        );
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_point, start + Duration::from_millis(200)),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            paragraph_app.handle_mouse_at(paragraph_release, start + Duration::from_millis(210)),
+            MouseAction::Copy("alpha beta\ngamma delta".to_owned())
+        );
     }
 
     #[test]
