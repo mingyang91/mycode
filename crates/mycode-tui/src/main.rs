@@ -11,11 +11,12 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, ValueEnum};
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::Show;
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -35,10 +36,11 @@ use nix::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout},
+    buffer::Buffer,
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget, Wrap},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,7 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 const CORE_PROTOCOL_VERSION: u64 = 2;
@@ -2164,6 +2167,141 @@ fn build_transcript_lines(
     }
     lines
 }
+const MAX_SELECTION_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SelectionPoint {
+    row: u16,
+    column: u16,
+}
+
+impl SelectionPoint {
+    fn from_mouse(event: MouseEvent) -> Self {
+        Self {
+            row: event.row,
+            column: event.column,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectionRegion {
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+}
+
+impl SelectionRegion {
+    fn from_transcript_rect(rect: Rect) -> Option<Self> {
+        let region = Self {
+            left: rect.x.saturating_add(1),
+            top: rect.y,
+            right: rect.x.saturating_add(rect.width.saturating_sub(1)),
+            bottom: rect.y.saturating_add(rect.height),
+        };
+        (region.left < region.right && region.top < region.bottom).then_some(region)
+    }
+
+    fn contains(self, point: SelectionPoint) -> bool {
+        point.column >= self.left
+            && point.column < self.right
+            && point.row >= self.top
+            && point.row < self.bottom
+    }
+
+    fn clamp(self, point: SelectionPoint) -> SelectionPoint {
+        SelectionPoint {
+            row: point.row.clamp(self.top, self.bottom - 1),
+            column: point.column.clamp(self.left, self.right - 1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool,
+}
+
+impl TextSelection {
+    fn ordered(self) -> (SelectionPoint, SelectionPoint) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    fn contains(self, point: SelectionPoint) -> bool {
+        let (start, end) = self.ordered();
+        if point.row < start.row || point.row > end.row {
+            return false;
+        }
+        if start.row == end.row {
+            return point.column >= start.column && point.column <= end.column;
+        }
+        if point.row == start.row {
+            return point.column >= start.column;
+        }
+        if point.row == end.row {
+            return point.column <= end.column;
+        }
+        true
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MouseAction {
+    None,
+    Redraw,
+    Scroll(i32),
+    Copy(String),
+    SelectionTooLarge,
+}
+
+struct SelectionOverlay {
+    selection: TextSelection,
+    region: SelectionRegion,
+}
+
+impl Widget for SelectionOverlay {
+    fn render(self, _area: Rect, buffer: &mut Buffer) {
+        let style = Style::default().fg(Color::Black).bg(COLOR_ACCENT);
+        for row in self.region.top..self.region.bottom {
+            for column in self.region.left..self.region.right {
+                if self.selection.contains(SelectionPoint { row, column })
+                    && let Some(cell) = buffer.cell_mut((column, row))
+                {
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
+}
+
+fn text_between_columns(line: &str, start: usize, end: usize) -> String {
+    let mut result = String::new();
+    let mut column = 0_usize;
+    let mut include_combining = false;
+    for character in line.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width == 0 {
+            if include_combining {
+                result.push(character);
+            }
+            continue;
+        }
+        let character_end = column.saturating_add(width);
+        include_combining = character_end > start && column < end;
+        if include_combining {
+            result.push(character);
+        }
+        column = character_end;
+    }
+    result
+}
 
 struct App {
     input: String,
@@ -2177,8 +2315,9 @@ struct App {
     max_scroll: usize,
     page_rows: usize,
     follow_tail: bool,
-    transcript_top: u16,
-    transcript_bottom: u16,
+    selection_region: Option<SelectionRegion>,
+    selection_lines: Vec<String>,
+    text_selection: Option<TextSelection>,
     transcript_revision: u64,
     transcript_details_expanded: bool,
     transcript_layout: Option<TranscriptLayoutCache>,
@@ -2200,8 +2339,9 @@ impl App {
             max_scroll: 0,
             page_rows: 1,
             follow_tail: true,
-            transcript_top: 0,
-            transcript_bottom: 0,
+            selection_region: None,
+            selection_lines: Vec::new(),
+            text_selection: None,
             transcript_revision: 0,
             transcript_details_expanded: false,
             transcript_layout: None,
@@ -2276,6 +2416,140 @@ impl App {
         self.slash_menu_dismissed = true;
         true
     }
+    fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+    }
+
+    fn update_selection_content(&mut self, region: Option<SelectionRegion>, text: &Text<'_>) {
+        if self.selection_region != region {
+            self.clear_text_selection();
+        }
+        self.selection_region = region;
+        self.selection_lines.clear();
+        self.selection_lines
+            .extend(text.lines.iter().map(Line::to_string));
+    }
+
+    fn completed_selection_action(&mut self) -> MouseAction {
+        let (Some(region), Some(selection)) = (self.selection_region, self.text_selection) else {
+            return MouseAction::Redraw;
+        };
+        let (start, end) = selection.ordered();
+        let mut text = String::new();
+        for row in start.row..=end.row {
+            let line_index = usize::from(row.saturating_sub(region.top));
+            let line = self
+                .selection_lines
+                .get(line_index)
+                .map_or("", String::as_str);
+            let start_column = if row == start.row {
+                start.column.saturating_sub(region.left)
+            } else {
+                0
+            };
+            let end_column = if row == end.row {
+                end.column.saturating_sub(region.left).saturating_add(1)
+            } else {
+                region.right.saturating_sub(region.left)
+            };
+            let selected =
+                text_between_columns(line, usize::from(start_column), usize::from(end_column));
+            let selected = selected.trim_end();
+            let separator_bytes = usize::from(row != start.row);
+            if text
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(selected.len())
+                > MAX_SELECTION_BYTES
+            {
+                return MouseAction::SelectionTooLarge;
+            }
+            if row != start.row {
+                text.push('\n');
+            }
+            text.push_str(selected);
+        }
+        if text.trim().is_empty() {
+            self.clear_text_selection();
+            MouseAction::Redraw
+        } else {
+            MouseAction::Copy(text)
+        }
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) -> MouseAction {
+        let point = SelectionPoint::from_mouse(event);
+        let over_transcript = self
+            .selection_region
+            .is_some_and(|region| point.row >= region.top && point.row < region.bottom);
+        match event.kind {
+            MouseEventKind::ScrollUp if over_transcript => {
+                self.clear_text_selection();
+                MouseAction::Scroll(-1)
+            }
+            MouseEventKind::ScrollDown if over_transcript => {
+                self.clear_text_selection();
+                MouseAction::Scroll(1)
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(region) = self.selection_region else {
+                    return MouseAction::None;
+                };
+                if !region.contains(point) {
+                    let changed = self.text_selection.take().is_some();
+                    return if changed {
+                        MouseAction::Redraw
+                    } else {
+                        MouseAction::None
+                    };
+                }
+                if event.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(selection) = &mut self.text_selection
+                {
+                    selection.focus = point;
+                    selection.dragging = true;
+                    return MouseAction::Redraw;
+                }
+                self.text_selection = Some(TextSelection {
+                    anchor: point,
+                    focus: point,
+                    dragging: true,
+                });
+                MouseAction::Redraw
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let (Some(region), Some(selection)) =
+                    (self.selection_region, &mut self.text_selection)
+                else {
+                    return MouseAction::None;
+                };
+                if !selection.dragging {
+                    return MouseAction::None;
+                }
+                selection.focus = region.clamp(point);
+                MouseAction::Redraw
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let (Some(region), Some(selection)) =
+                    (self.selection_region, &mut self.text_selection)
+                else {
+                    return MouseAction::None;
+                };
+                if !selection.dragging {
+                    return MouseAction::None;
+                }
+                selection.focus = region.clamp(point);
+                let is_click = selection.anchor == selection.focus;
+                selection.dragging = false;
+                if is_click {
+                    self.clear_text_selection();
+                    return MouseAction::Redraw;
+                }
+                self.completed_selection_action()
+            }
+            _ => MouseAction::None,
+        }
+    }
 
     fn set_snapshot(&mut self, snapshot: CoreSnapshot) {
         let transcript_changed = self.snapshot.messages.len() != snapshot.messages.len()
@@ -2284,6 +2558,7 @@ impl App {
         if transcript_changed {
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_layout = None;
+            self.clear_text_selection();
         }
     }
 
@@ -2291,22 +2566,26 @@ impl App {
         self.transcript_details_expanded = !self.transcript_details_expanded;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_layout = None;
+        self.clear_text_selection();
     }
 
     fn push_local_entry(&mut self, entry: LocalTranscriptEntry) {
         self.local_entries.push(entry);
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_layout = None;
+        self.clear_text_selection();
     }
 
     fn set_local_entries(&mut self, entries: Vec<LocalTranscriptEntry>) {
         self.local_entries = entries;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_layout = None;
+        self.clear_text_selection();
     }
 
     fn start_live_tool(&mut self, call_id: String, label: String) {
         self.live_tool = Some(LiveToolOutput::new(call_id, label));
+        self.clear_text_selection();
     }
 
     fn append_live_progress(
@@ -2325,6 +2604,7 @@ impl App {
         if let Some(live) = &mut self.live_tool {
             live.append(progress.stream, &bytes);
         }
+        self.clear_text_selection();
         Ok(())
     }
 
@@ -2335,11 +2615,13 @@ impl App {
             .is_some_and(|live| live.call_id == call_id)
         {
             self.live_tool = None;
+            self.clear_text_selection();
         }
     }
 
     fn clear_live_tool(&mut self) {
         self.live_tool = None;
+        self.clear_text_selection();
     }
 
     fn visible_transcript(&mut self, width: u16, height: u16) -> Text<'static> {
@@ -2402,6 +2684,7 @@ impl App {
         };
         self.scroll_offset = current.saturating_sub(rows.max(1));
         self.follow_tail = false;
+        self.clear_text_selection();
     }
 
     fn scroll_down(&mut self, rows: usize) {
@@ -2412,6 +2695,7 @@ impl App {
         };
         self.scroll_offset = current.saturating_add(rows.max(1)).min(self.max_scroll);
         self.follow_tail = self.scroll_offset == self.max_scroll;
+        self.clear_text_selection();
     }
 
     fn page_up(&mut self) {
@@ -2425,11 +2709,13 @@ impl App {
     fn scroll_home(&mut self) {
         self.scroll_offset = 0;
         self.follow_tail = self.max_scroll == 0;
+        self.clear_text_selection();
     }
 
     fn scroll_end(&mut self) {
         self.scroll_offset = self.max_scroll;
         self.follow_tail = true;
+        self.clear_text_selection();
     }
 
     fn scroll_delta(&mut self, delta: i32) {
@@ -2437,17 +2723,6 @@ impl App {
             self.scroll_up(delta.unsigned_abs() as usize);
         } else if delta > 0 {
             self.scroll_down(delta.unsigned_abs() as usize);
-        }
-    }
-
-    fn mouse_scroll_delta(&self, event: MouseEvent) -> i32 {
-        if event.row < self.transcript_top || event.row >= self.transcript_bottom {
-            return 0;
-        }
-        match event.kind {
-            MouseEventKind::ScrollUp => -1,
-            MouseEventKind::ScrollDown => 1,
-            _ => 0,
         }
     }
 }
@@ -2794,13 +3069,30 @@ async fn tui_loop(
                             KeyAction::Submit(_) | KeyAction::Btw(_) | KeyAction::Approval { .. } => {}
                         }
                     }
-                    CrosstermEvent::Mouse(mouse) => {
-                        let delta = app.mouse_scroll_delta(mouse);
-                        if delta != 0 {
+                    CrosstermEvent::Mouse(mouse) => match app.handle_mouse(mouse) {
+                        MouseAction::None => {}
+                        MouseAction::Redraw => dirty = true,
+                        MouseAction::Scroll(delta) => {
                             pending_scroll = pending_scroll.saturating_add(delta);
                             dirty = true;
                         }
-                    }
+                        MouseAction::Copy(text) => {
+                            let character_count = text.chars().count();
+                            execute!(
+                                std::io::stdout(),
+                                CopyToClipboard::to_clipboard_from(text)
+                            )?;
+                            app.status = format!("Copied {character_count} characters");
+                            dirty = true;
+                        }
+                        MouseAction::SelectionTooLarge => {
+                            app.status = format!(
+                                "Selection exceeds the {} byte clipboard limit",
+                                MAX_SELECTION_BYTES
+                            );
+                            dirty = true;
+                        }
+                    },
                     CrosstermEvent::Resize(_, _) => dirty = true,
                     _ => {}
                 }
@@ -3403,12 +3695,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let content_width = transcript.width.saturating_sub(2);
     let content_height = transcript.height;
     let visible_transcript = app.visible_transcript(content_width, content_height);
-    app.transcript_top = transcript.y;
-    app.transcript_bottom = transcript.y.saturating_add(transcript.height);
+    let selection_region = SelectionRegion::from_transcript_rect(transcript);
+    app.update_selection_content(selection_region, &visible_transcript);
     frame.render_widget(
         Paragraph::new(visible_transcript).block(Block::default().padding(Padding::horizontal(1))),
         transcript,
     );
+    if let (Some(selection), Some(region)) = (app.text_selection, app.selection_region) {
+        frame.render_widget(SelectionOverlay { selection, region }, transcript);
+    }
     if candidate_height > 0 {
         let candidate_rows = usize::from(candidates.height.saturating_sub(2));
         frame.render_widget(
@@ -3528,17 +3823,20 @@ mod tests {
     };
 
     use clap::Parser;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{Terminal, backend::TestBackend, text::Line};
 
     use super::{
         App, Args, BtwSidechainStore, COLOR_ACCENT, COLOR_ASSISTANT_BACKGROUND, COLOR_MUTED,
         COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall, KeyAction,
-        LiveToolOutput, LocalTranscriptEntry, PermissionMode, SlashCommand, SlashCommandError,
-        ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
+        LiveToolOutput, LocalTranscriptEntry, MouseAction, PermissionMode, SelectionPoint,
+        SelectionRegion, SlashCommand, SlashCommandError, TextSelection, ToolOutputStream,
+        ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
         automatically_safe_tool_names, btw_sidechain_path, build_live_tool_lines,
         build_transcript_lines, draw, handle_key, parse_openai_tool_calls, parse_submission,
-        startup_permission_mode,
+        startup_permission_mode, text_between_columns,
     };
 
     #[test]
@@ -4358,6 +4656,155 @@ mod tests {
         assert!(!screen.contains("You"));
         assert!(!screen.contains("Assistant"));
     }
+    #[test]
+    fn mouse_selection_overlay_highlights_transcript_cells() {
+        let snapshot = CoreSnapshot {
+            messages: vec![CoreMessage {
+                role: "assistant".to_owned(),
+                content: "selectable transcript".to_owned(),
+                ..CoreMessage::default()
+            }],
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("initial transcript frame must draw");
+        let region = app.selection_region.expect("transcript must be selectable");
+        app.text_selection = Some(TextSelection {
+            anchor: SelectionPoint {
+                row: region.top,
+                column: region.left,
+            },
+            focus: SelectionPoint {
+                row: region.top,
+                column: region.left + 2,
+            },
+            dragging: false,
+        });
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("selected transcript frame must draw");
+        for column in region.left..=region.left + 2 {
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((column, region.top))
+                .expect("selected cell must exist");
+            assert_eq!(cell.bg, COLOR_ACCENT);
+        }
+    }
+
+    #[test]
+    fn mouse_drag_copies_selected_transcript_text() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.selection_region = Some(SelectionRegion {
+            left: 2,
+            top: 4,
+            right: 14,
+            bottom: 7,
+        });
+        app.selection_lines = vec![
+            "alpha beta".to_owned(),
+            "gamma delta".to_owned(),
+            "third".to_owned(),
+        ];
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.handle_mouse(down), MouseAction::Redraw);
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 6,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.handle_mouse(drag), MouseAction::Redraw);
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 6,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            app.handle_mouse(up),
+            MouseAction::Copy("alpha beta\ngamma".to_owned())
+        );
+        assert!(!app.text_selection.expect("selection must remain").dragging);
+    }
+    #[test]
+    fn click_inside_transcript_does_not_copy_text() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.selection_region = Some(SelectionRegion {
+            left: 2,
+            top: 4,
+            right: 14,
+            bottom: 7,
+        });
+        app.selection_lines = vec!["alpha beta".to_owned()];
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..down
+        };
+
+        assert_eq!(app.handle_mouse(down), MouseAction::Redraw);
+        assert_eq!(app.handle_mouse(up), MouseAction::Redraw);
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn selection_extracts_wide_and_combining_characters() {
+        assert_eq!(text_between_columns("a界b", 1, 3), "界");
+        assert_eq!(text_between_columns("a界b", 2, 3), "界");
+        assert_eq!(text_between_columns("e\u{301}x", 0, 1), "e\u{301}");
+    }
+
+    #[test]
+    fn mouse_wheel_only_scrolls_over_transcript() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.max_scroll = 20;
+        app.scroll_offset = 20;
+        app.selection_region = Some(SelectionRegion {
+            left: 1,
+            top: 2,
+            right: 20,
+            bottom: 12,
+        });
+
+        let inside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let MouseAction::Scroll(delta) = app.handle_mouse(inside) else {
+            panic!("wheel over transcript must request scrolling");
+        };
+        app.scroll_delta(delta);
+        assert_eq!(app.scroll_offset, 19);
+
+        let outside = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 3,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.handle_mouse(outside), MouseAction::None);
+        assert_eq!(app.scroll_offset, 19);
+    }
 
     #[test]
     fn scroll_navigation_leaves_and_restores_tail_following() {
@@ -4384,33 +4831,6 @@ mod tests {
         app.scroll_end();
         assert_eq!(app.scroll_offset, 20);
         assert!(app.follow_tail);
-    }
-
-    #[test]
-    fn mouse_wheel_only_scrolls_over_transcript() {
-        let mut app = App::new(CoreSnapshot::default());
-        app.max_scroll = 20;
-        app.scroll_offset = 20;
-        app.transcript_top = 2;
-        app.transcript_bottom = 12;
-
-        let inside = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 3,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
-        app.scroll_delta(app.mouse_scroll_delta(inside));
-        assert_eq!(app.scroll_offset, 19);
-
-        let outside = MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 3,
-            row: 15,
-            modifiers: KeyModifiers::NONE,
-        };
-        app.scroll_delta(app.mouse_scroll_delta(outside));
-        assert_eq!(app.scroll_offset, 19);
     }
 
     #[test]
