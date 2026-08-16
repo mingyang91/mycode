@@ -42,11 +42,24 @@ private def finishTool (state : State) (call : ToolCall) (content : String) (isE
     isError
   }
 
-private def abortPendingTools (state : State) : State :=
+private def finishPendingTools (state : State) (content : String) : State :=
   let unanswered := state.pendingCalls.toList.drop state.currentCall
-  let completed := unanswered.foldl (fun next call =>
-    finishTool next call "Tool execution was cancelled before a result was observed." true) state
-  { completed with phase := .idle, pendingCalls := #[], currentCall := 0 }
+  unanswered.foldl (fun next call => finishTool next call content true) state
+
+private def resumeWithPendingSteers (state : State) : State :=
+  let completed := finishPendingTools state "Tool call skipped because the user steered the active turn."
+  let steered := state.pendingSteers.foldl (fun next text =>
+    appendMessage next { role := "user", content := text }) completed
+  { steered with
+    phase := .waitingModel
+    pendingCalls := #[]
+    currentCall := 0
+    pendingSteers := #[]
+  }
+
+private def abortPendingTools (state : State) : State :=
+  let completed := finishPendingTools state "Tool execution was cancelled before a result was observed."
+  { completed with phase := .idle, pendingCalls := #[], currentCall := 0, pendingSteers := #[] }
 
 private def requireIdle (state : State) (action : String) : Except String Unit :=
   match state.phase with
@@ -79,6 +92,18 @@ public def transition (state : State) (event : Event) : Except String (State × 
         let next := appendMessage { state with phase := .waitingModel } { role := "user", content := text }
         pure (next, #[Effect.requestModel])
     | none => throw "submit event is missing text"
+  | "steer" =>
+    match event.text? with
+    | some text =>
+      if text.isEmpty then throw "steer event text must not be empty"
+      else
+        let queued := { state with pendingSteers := state.pendingSteers.push text }
+        match state.phase with
+        | .idle => throw "cannot steer while the agent is idle"
+        | .waitingTool _ => pure (queued, #[])
+        | .waitingModel => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
+        | .waitingApproval _ => pure (resumeWithPendingSteers queued, #[Effect.requestModel])
+    | none => throw "steer event is missing text"
   | "model_completed" =>
     match state.phase with
     | .waitingModel =>
@@ -113,8 +138,10 @@ public def transition (state : State) (event : Event) : Except String (State × 
       match currentTool? state with
       | some call =>
         let content := event.content?.getD ""
-        let next := finishTool state call content (event.isError?.getD false)
-        pure <| advance { next with currentCall := state.currentCall + 1 }
+        let next := { finishTool state call content (event.isError?.getD false) with
+          currentCall := state.currentCall + 1 }
+        if next.pendingSteers.isEmpty then pure <| advance next
+        else pure (resumeWithPendingSteers next, #[Effect.requestModel])
       | none => throw "tool_completed arrived without a pending tool call"
     | _ => throw "tool_completed arrived without a running tool"
   | "abort" =>

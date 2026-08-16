@@ -11,9 +11,9 @@ Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm she
 - Rust must never execute a model-proposed tool merely because it parsed a provider response. It may invoke a plugin only after the Lean core emits `invoke_tool`.
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.
+- Steer belongs to the main Lean state, unlike the independent BTW sidechain. A steer replaces an in-flight model request; during a tool it is persisted until the current result is known, then Lean synthesizes results for every skipped tool before appending the new user instruction.
 - Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
 - The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
-- The TUI opens a slash-command candidate menu while the user types a command name. `Up` and `Down` select a candidate, `Tab` completes it, and `Esc` closes the menu when the runtime is idle; a busy runtime keeps `Esc` reserved for cooperative cancellation. A `//` prefix sends a literal slash prompt.
 
 ## Lean rules
 
@@ -54,7 +54,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
+For provider or orchestration changes, run the affected Ratatui flow against the local OpenAI or Anthropic example server, plus a real Linewise gateway smoke when that adapter changes. Observe model → live stdout/stderr tail → plugin terminal result → model completion, model-request and tool-boundary steer, `auto` allow and prompt paths, cooperative Escape cancellation, and a clean TUI exit.
 
 ## Git
 

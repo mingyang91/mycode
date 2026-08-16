@@ -54,7 +54,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const CORE_PROTOCOL_VERSION: u64 = 1;
+const CORE_PROTOCOL_VERSION: u64 = 2;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -196,6 +196,7 @@ enum SlashCommandError {
 enum SlashCommandKind {
     Btw,
     Exit,
+    Steer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,7 +208,7 @@ struct SlashCommandSpec {
     takes_arguments: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommandSpec; 2] = [
+const SLASH_COMMANDS: [SlashCommandSpec; 3] = [
     SlashCommandSpec {
         name: "btw",
         usage: "/btw <question>",
@@ -221,6 +222,13 @@ const SLASH_COMMANDS: [SlashCommandSpec; 2] = [
         description: "Exit MyCode cleanly",
         kind: SlashCommandKind::Exit,
         takes_arguments: false,
+    },
+    SlashCommandSpec {
+        name: "steer",
+        usage: "/steer <instruction>",
+        description: "Redirect the active main task",
+        kind: SlashCommandKind::Steer,
+        takes_arguments: true,
     },
 ];
 
@@ -243,6 +251,7 @@ fn slash_command_candidates(input: &str) -> impl Iterator<Item = &'static SlashC
 enum SlashCommand {
     Btw(String),
     Exit,
+    Steer(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -276,6 +285,12 @@ fn parse_submission(text: String) -> Result<UserSubmission, SlashCommandError> {
             Ok(UserSubmission::Command(SlashCommand::Exit))
         }
         SlashCommandKind::Exit => Err(SlashCommandError::InvalidUsage(spec.usage)),
+        SlashCommandKind::Steer if arguments.is_empty() => {
+            Err(SlashCommandError::InvalidUsage(spec.usage))
+        }
+        SlashCommandKind::Steer => Ok(UserSubmission::Command(SlashCommand::Steer(
+            arguments.to_owned(),
+        ))),
     }
 }
 
@@ -375,6 +390,20 @@ impl CoreEvent {
         }
     }
 
+    fn steer(text: String) -> Self {
+        Self {
+            kind: "steer".to_owned(),
+            text: Some(text),
+            tool_calls: Vec::new(),
+            call_id: None,
+            approved: None,
+            content: None,
+            is_error: None,
+            safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
+        }
+    }
+
     fn model_completed(content: String, tool_calls: Vec<CoreToolCall>) -> Self {
         Self {
             kind: "model_completed".to_owned(),
@@ -453,6 +482,15 @@ struct CoreSnapshot {
     safe_tools: Vec<String>,
     #[serde(default = "default_permission_mode")]
     permission_mode: String,
+    #[serde(default)]
+    pending_steers: Vec<String>,
+}
+
+fn snapshot_accepts_steer(snapshot: &CoreSnapshot) -> bool {
+    matches!(
+        snapshot.phase.as_str(),
+        "waiting_model" | "waiting_approval" | "waiting_tool"
+    )
 }
 
 fn startup_permission_mode(
@@ -1327,7 +1365,10 @@ fn anthropic_messages(messages: &[CoreMessage]) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
     for message in messages {
         let next = match message.role.as_str() {
-            "user" => json!({"role": "user", "content": message.content}),
+            "user" => json!({
+                "role": "user",
+                "content": [{"type": "text", "text": message.content}]
+            }),
             "assistant" => {
                 let mut content = Vec::new();
                 if !message.content.is_empty() {
@@ -2422,6 +2463,7 @@ enum RuntimeAction {
         approved: bool,
     },
     Drive(CoreResponse),
+    Steer(String),
 }
 
 enum RuntimeUpdate {
@@ -2456,6 +2498,7 @@ enum KeyAction {
     Quit,
     Cancel,
     Submit(String),
+    Steer(String),
     Btw(String),
     Approval { call_id: String, approved: bool },
 }
@@ -2474,6 +2517,7 @@ type SharedRuntime = Arc<Mutex<RuntimeResources>>;
 struct ActiveRuntime {
     handle: JoinHandle<()>,
     cancel: CancellationToken,
+    steer: mpsc::UnboundedSender<String>,
 }
 
 fn restore_terminal() {
@@ -2693,6 +2737,29 @@ async fn tui_loop(
                                 return Ok(());
                             }
                             KeyAction::Cancel => request_cancel(&mut active, app),
+                            KeyAction::Steer(text) => {
+                                if let Some(active_runtime) = active.as_ref() {
+                                    match active_runtime.steer.send(text) {
+                                        Ok(()) => app.status = "Steering…".to_owned(),
+                                        Err(error) => {
+                                            app.input = error.0;
+                                            app.input_changed();
+                                            app.status =
+                                                "Task settled before steer arrived · press Enter to send"
+                                                    .to_owned();
+                                        }
+                                    }
+                                } else {
+                                    app.busy = true;
+                                    app.approval = None;
+                                    app.status = "Steering…".to_owned();
+                                    active = Some(spawn_runtime_action(
+                                        Arc::clone(&runtime),
+                                        RuntimeAction::Steer(text),
+                                        updates.clone(),
+                                    ));
+                                }
+                            }
                             KeyAction::Submit(text) if active.is_none() => {
                                 app.busy = true;
                                 app.status = "Submitting…".to_owned();
@@ -2850,7 +2917,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
     if app.busy && matches!(key.code, KeyCode::Esc) {
         return KeyAction::Cancel;
     }
-    if app.approval.is_some() {
+    if app.approval.is_some() && app.input.is_empty() {
         return match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let call = app.approval.take().expect("approval checked");
@@ -2880,10 +2947,32 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.clear_input();
                     KeyAction::Quit
                 }
-                Ok(_) | Err(_) if app.busy => KeyAction::None,
+                Ok(UserSubmission::Command(SlashCommand::Steer(instruction))) => {
+                    app.clear_input();
+                    if snapshot_accepts_steer(&app.snapshot) {
+                        KeyAction::Steer(instruction)
+                    } else {
+                        app.status = "Error: no active main task to steer".to_owned();
+                        KeyAction::None
+                    }
+                }
+                Ok(UserSubmission::Prompt(_))
+                    if app.busy && !snapshot_accepts_steer(&app.snapshot) =>
+                {
+                    KeyAction::None
+                }
+                Ok(UserSubmission::Prompt(prompt)) if snapshot_accepts_steer(&app.snapshot) => {
+                    app.clear_input();
+                    KeyAction::Steer(prompt)
+                }
                 Ok(UserSubmission::Prompt(prompt)) => {
                     app.clear_input();
                     KeyAction::Submit(prompt)
+                }
+                Ok(UserSubmission::Command(SlashCommand::Btw(_)))
+                    if app.busy || snapshot_accepts_steer(&app.snapshot) =>
+                {
+                    KeyAction::None
                 }
                 Ok(UserSubmission::Command(SlashCommand::Btw(question))) => {
                     app.clear_input();
@@ -2923,8 +3012,9 @@ fn spawn_runtime_action(
 ) -> ActiveRuntime {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let (steer, mut steer_rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
-        match run_runtime_action(&runtime, action, &updates, &task_cancel).await {
+        match run_runtime_action(&runtime, action, &updates, &task_cancel, &mut steer_rx).await {
             Ok(final_state) => {
                 let _ = updates.send(RuntimeUpdate::Settled(final_state));
             }
@@ -2933,7 +3023,11 @@ fn spawn_runtime_action(
             }
         }
     });
-    ActiveRuntime { handle, cancel }
+    ActiveRuntime {
+        handle,
+        cancel,
+        steer,
+    }
 }
 
 async fn run_runtime_action(
@@ -2941,6 +3035,7 @@ async fn run_runtime_action(
     action: RuntimeAction,
     updates: &mpsc::UnboundedSender<RuntimeUpdate>,
     cancel: &CancellationToken,
+    steer: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<RuntimeFinal, AppError> {
     let mut runtime = runtime.lock().await;
     match action {
@@ -2971,17 +3066,21 @@ async fn run_runtime_action(
         }
         RuntimeAction::Submit(text) => {
             let response = runtime.core.event(&CoreEvent::submit(text)).await?;
-            drive_response(response, &mut runtime, updates, cancel).await
+            drive_response(response, &mut runtime, updates, cancel, steer).await
+        }
+        RuntimeAction::Steer(text) => {
+            let response = runtime.core.event(&CoreEvent::steer(text)).await?;
+            drive_response(response, &mut runtime, updates, cancel, steer).await
         }
         RuntimeAction::Approval { call_id, approved } => {
             let response = runtime
                 .core
                 .event(&CoreEvent::approval(call_id, approved))
                 .await?;
-            drive_response(response, &mut runtime, updates, cancel).await
+            drive_response(response, &mut runtime, updates, cancel, steer).await
         }
         RuntimeAction::Drive(response) => {
-            drive_response(response, &mut runtime, updates, cancel).await
+            drive_response(response, &mut runtime, updates, cancel, steer).await
         }
     }
 }
@@ -2991,84 +3090,127 @@ async fn drive_response(
     runtime: &mut RuntimeResources,
     updates: &mpsc::UnboundedSender<RuntimeUpdate>,
     cancel: &CancellationToken,
+    steer: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<RuntimeFinal, AppError> {
     let mut snapshot = response.snapshot;
     let mut effects = response.effects;
     send_runtime_progress(updates, &snapshot, "Processing…");
-    while let Some(effect) = effects.pop() {
-        if cancel.is_cancelled() {
-            return cancel_runtime(runtime).await;
-        }
-        match effect.kind.as_str() {
-            "request_model" => {
-                send_runtime_progress(updates, &snapshot, "Waiting for model…");
-                let completion = tokio::select! {
-                    () = cancel.cancelled() => return cancel_runtime(runtime).await,
-                    result = runtime.provider.complete(&snapshot, runtime.plugins.model_tools()) => result?,
-                };
-                let next = runtime
-                    .core
-                    .event(&CoreEvent::model_completed(
-                        completion.content,
-                        completion.tool_calls,
-                    ))
-                    .await?;
-                snapshot = next.snapshot;
-                effects.extend(next.effects);
+    loop {
+        while let Some(effect) = effects.pop() {
+            if cancel.is_cancelled() {
+                return cancel_runtime(runtime).await;
             }
-            "request_approval" => {
-                let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
-                    kind: "request_approval".to_owned(),
-                })?;
-                return Ok(RuntimeFinal {
-                    snapshot,
-                    status: format!("Approve {}? [y]es / [n]o", call.display_label()),
-                    approval: Some(call),
-                    local_entry: None,
-                });
-            }
-            "invoke_tool" => {
-                let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
-                    kind: "invoke_tool".to_owned(),
-                })?;
-                let _ = updates.send(RuntimeUpdate::ToolStarted {
-                    call_id: call.call_id.clone(),
-                    label: call.display_label().to_owned(),
-                });
-                send_runtime_progress(
-                    updates,
-                    &snapshot,
-                    &format!("Running {}…", call.display_label()),
-                );
-                let progress_call_id = call.call_id.clone();
-                let tool_result = tokio::select! {
-                    () = cancel.cancelled() => None,
-                    result = runtime.plugins.call(&call, |progress| {
-                        let _ = updates.send(RuntimeUpdate::ToolProgress {
-                            call_id: progress_call_id.clone(),
-                            progress,
+            match effect.kind.as_str() {
+                "request_model" => {
+                    send_runtime_progress(updates, &snapshot, "Waiting for model…");
+                    let completion = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return cancel_runtime(runtime).await,
+                        Some(text) = steer.recv() => {
+                            let next = apply_steer_event(runtime, &snapshot, text).await?;
+                            snapshot = next.snapshot;
+                            effects.clear();
+                            effects.extend(next.effects);
+                            send_runtime_progress(updates, &snapshot, "Steering…");
+                            continue;
+                        }
+                        result = runtime.provider.complete(&snapshot, runtime.plugins.model_tools()) => result?,
+                    };
+                    let next = runtime
+                        .core
+                        .event(&CoreEvent::model_completed(
+                            completion.content,
+                            completion.tool_calls,
+                        ))
+                        .await?;
+                    snapshot = next.snapshot;
+                    effects.extend(next.effects);
+                }
+                "request_approval" => {
+                    if let Ok(text) = steer.try_recv() {
+                        let next = apply_steer_event(runtime, &snapshot, text).await?;
+                        snapshot = next.snapshot;
+                        effects.clear();
+                        effects.extend(next.effects);
+                        send_runtime_progress(updates, &snapshot, "Steering…");
+                        continue;
+                    }
+                    let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
+                        kind: "request_approval".to_owned(),
+                    })?;
+                    return Ok(RuntimeFinal {
+                        snapshot,
+                        status: format!("Approve {}? [y]es / [n]o", call.display_label()),
+                        approval: Some(call),
+                        local_entry: None,
+                    });
+                }
+                "invoke_tool" => {
+                    let call = effect.call.ok_or_else(|| AppError::MissingCoreEffectCall {
+                        kind: "invoke_tool".to_owned(),
+                    })?;
+                    let _ = updates.send(RuntimeUpdate::ToolStarted {
+                        call_id: call.call_id.clone(),
+                        label: call.display_label().to_owned(),
+                    });
+                    send_runtime_progress(
+                        updates,
+                        &snapshot,
+                        &format!("Running {}…", call.display_label()),
+                    );
+                    let progress_call_id = call.call_id.clone();
+                    let tool_result = {
+                        let plugin_call = runtime.plugins.call(&call, |progress| {
+                            let _ = updates.send(RuntimeUpdate::ToolProgress {
+                                call_id: progress_call_id.clone(),
+                                progress,
+                            });
                         });
-                    }) => Some(result),
-                };
-                let Some(tool_result) = tool_result else {
-                    return cancel_runtime(runtime).await;
-                };
-                let (content, is_error) = match tool_result {
-                    Ok(result) => (result.output, false),
-                    Err(error) => (format!("Plugin execution failed: {error}"), true),
-                };
-                let _ = updates.send(RuntimeUpdate::ToolFinished {
-                    call_id: call.call_id.clone(),
-                });
-                let next = runtime
-                    .core
-                    .event(&CoreEvent::tool_completed(call.call_id, content, is_error))
-                    .await?;
-                snapshot = next.snapshot;
-                effects.extend(next.effects);
+                        tokio::pin!(plugin_call);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => break None,
+                                Some(text) = steer.recv() => {
+                                    let queued = runtime.core.event(&CoreEvent::steer(text)).await?;
+                                    snapshot = queued.snapshot;
+                                    send_runtime_progress(
+                                        updates,
+                                        &snapshot,
+                                        "Steer queued · finishing current tool…",
+                                    );
+                                }
+                                result = &mut plugin_call => break Some(result),
+                            }
+                        }
+                    };
+                    let Some(tool_result) = tool_result else {
+                        return cancel_runtime(runtime).await;
+                    };
+                    let (content, is_error) = match tool_result {
+                        Ok(result) => (result.output, false),
+                        Err(error) => (format!("Plugin execution failed: {error}"), true),
+                    };
+                    let _ = updates.send(RuntimeUpdate::ToolFinished {
+                        call_id: call.call_id.clone(),
+                    });
+                    let next = runtime
+                        .core
+                        .event(&CoreEvent::tool_completed(call.call_id, content, is_error))
+                        .await?;
+                    snapshot = next.snapshot;
+                    effects.extend(next.effects);
+                }
+                _ => return Err(AppError::UnknownCoreEffect { kind: effect.kind }),
             }
-            _ => return Err(AppError::UnknownCoreEffect { kind: effect.kind }),
         }
+        let Ok(text) = steer.try_recv() else {
+            break;
+        };
+        let next = apply_steer_event(runtime, &snapshot, text).await?;
+        snapshot = next.snapshot;
+        effects.extend(next.effects);
+        send_runtime_progress(updates, &snapshot, "Steering…");
     }
     apply_desired_permissions(runtime, &mut snapshot).await?;
     Ok(RuntimeFinal {
@@ -3077,6 +3219,19 @@ async fn drive_response(
         approval: None,
         local_entry: None,
     })
+}
+
+async fn apply_steer_event(
+    runtime: &mut RuntimeResources,
+    snapshot: &CoreSnapshot,
+    text: String,
+) -> Result<CoreResponse, AppError> {
+    let event = if snapshot_accepts_steer(snapshot) {
+        CoreEvent::steer(text)
+    } else {
+        CoreEvent::submit(text)
+    };
+    Ok(runtime.core.event(&event).await?)
 }
 
 async fn cancel_runtime(runtime: &mut RuntimeResources) -> Result<RuntimeFinal, AppError> {
@@ -3275,8 +3430,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let (input_title, input_color) = match app.approval.as_ref() {
         Some(call) => (
-            format!(" Approval · {} · y allow · n deny ", call.display_label()),
+            format!(
+                " Approval · {} · y allow · n deny · /steer redirect ",
+                call.display_label()
+            ),
             COLOR_TOOL,
+        ),
+        None if app.busy && snapshot_accepts_steer(&app.snapshot) => (
+            " Message · Enter steer · Esc cancel ".to_owned(),
+            COLOR_ACCENT,
         ),
         None if app.busy => (" Message · Esc cancel ".to_owned(), COLOR_ACCENT),
         None => (" Message · Enter send ".to_owned(), COLOR_MUTED),
@@ -3329,8 +3491,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · pending {} · safe {} · permission {}{scroll}{details}",
+                    " · pending {} · steer {} · safe {} · permission {}{scroll}{details}",
                     app.snapshot.pending_calls.len(),
+                    app.snapshot.pending_steers.len(),
                     app.snapshot.safe_tools.len(),
                     app.snapshot.permission_mode
                 ),
@@ -3460,6 +3623,12 @@ mod tests {
             )))
         );
         assert_eq!(
+            parse_submission("/steer use the safer plan".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Steer(
+                "use the safer plan".to_owned()
+            )))
+        );
+        assert_eq!(
             parse_submission("/exit".to_owned()),
             Ok(UserSubmission::Command(SlashCommand::Exit))
         );
@@ -3481,7 +3650,7 @@ mod tests {
         let mut app = App::new(CoreSnapshot::default());
         app.input = "/".to_owned();
         assert!(app.slash_menu_visible());
-        assert_eq!(app.slash_candidate_count(), 2);
+        assert_eq!(app.slash_candidate_count(), 3);
 
         let action = handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, KeyAction::None));
@@ -3515,7 +3684,7 @@ mod tests {
         app.follow_tail = true;
 
         let _ = handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.slash_selection, 1);
+        assert_eq!(app.slash_selection, 2);
         assert_eq!(app.scroll_offset, 20);
         assert!(app.follow_tail);
 
@@ -3570,6 +3739,8 @@ mod tests {
             "Ask outside the main conversation",
             "/exit",
             "Exit MyCode cleanly",
+            "/steer <instruction>",
+            "Redirect the active main task",
         ] {
             assert!(
                 screen.contains(expected),
@@ -3594,6 +3765,57 @@ mod tests {
             handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
             KeyAction::Quit
         ));
+    }
+
+    #[test]
+    fn enter_steers_active_model_and_waiting_approval() {
+        let mut model_app = App::new(CoreSnapshot {
+            phase: "waiting_model".to_owned(),
+            ..CoreSnapshot::default()
+        });
+        model_app.busy = true;
+        model_app.input = "Use the safer plan".to_owned();
+        match handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut model_app,
+        ) {
+            KeyAction::Steer(text) => assert_eq!(text, "Use the safer plan"),
+            _ => panic!("busy main task must accept steer input"),
+        }
+        assert!(model_app.input.is_empty());
+
+        let mut approval_app = App::new(CoreSnapshot {
+            phase: "waiting_approval".to_owned(),
+            ..CoreSnapshot::default()
+        });
+        approval_app.approval = Some(CoreToolCall {
+            call_id: "call-steer-approval".to_owned(),
+            name: "write".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        approval_app.input = "/steer do not write".to_owned();
+        match handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut approval_app,
+        ) {
+            KeyAction::Steer(text) => assert_eq!(text, "do not write"),
+            _ => panic!("approval prompt must accept explicit steer input"),
+        }
+    }
+
+    #[test]
+    fn main_prompt_waits_while_btw_sidechain_is_busy() {
+        let mut app = App::new(CoreSnapshot {
+            phase: "idle".to_owned(),
+            ..CoreSnapshot::default()
+        });
+        app.busy = true;
+        app.input = "Continue the main task".to_owned();
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app),
+            KeyAction::None
+        ));
+        assert_eq!(app.input, "Continue the main task");
     }
 
     #[test]
@@ -3711,6 +3933,62 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn merges_anthropic_tool_results_before_steer_text() {
+        let mapped = anthropic_messages(&[
+            CoreMessage {
+                role: "tool".to_owned(),
+                content: "first contents".to_owned(),
+                tool_call_id: Some("call_1".to_owned()),
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                content: "skipped".to_owned(),
+                tool_call_id: Some("call_2".to_owned()),
+                is_error: true,
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "user".to_owned(),
+                content: "Use the new plan".to_owned(),
+                ..CoreMessage::default()
+            },
+        ]);
+        assert_eq!(mapped.len(), 1);
+        let content = mapped[0]["content"]
+            .as_array()
+            .expect("Anthropic user content must use blocks");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "Use the new plan");
+    }
+
+    #[test]
+    fn merges_consecutive_anthropic_user_instructions_as_text_blocks() {
+        let mapped = anthropic_messages(&[
+            CoreMessage {
+                role: "user".to_owned(),
+                content: "Original plan".to_owned(),
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "user".to_owned(),
+                content: "Steered plan".to_owned(),
+                ..CoreMessage::default()
+            },
+        ]);
+        assert_eq!(mapped.len(), 1);
+        let content = mapped[0]["content"]
+            .as_array()
+            .expect("Anthropic user content must use blocks");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "Original plan");
+        assert_eq!(content[1]["text"], "Steered plan");
     }
 
     #[test]
@@ -4070,7 +4348,7 @@ mod tests {
             "└─ bash  git status --short",
             "└ Tool result",
             "Message · Enter send",
-            "Ready · pending 0 · safe 2",
+            "Ready · pending 0 · steer 0 · safe 2",
         ] {
             assert!(
                 screen.contains(expected),

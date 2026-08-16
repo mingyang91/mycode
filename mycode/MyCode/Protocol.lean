@@ -4,7 +4,7 @@ open Lean
 
 namespace MyCode
 
-public def protocolVersion : Nat := 1
+public def protocolVersion : Nat := 2
 
 public structure ToolCall where
   callId : String
@@ -40,6 +40,7 @@ public structure State where
   currentCall : Nat := 0
   safeTools : Array String := #[]
   permissionMode : String := "ask"
+  pendingSteers : Array String := #[]
   deriving Inhabited, ToJson, FromJson
 
 public structure Event where
@@ -66,6 +67,7 @@ public structure Snapshot where
   currentCall : Nat
   safeTools : Array String
   permissionMode : String
+  pendingSteers : Array String
   deriving Inhabited, ToJson, FromJson
 
 public def State.snapshot (state : State) : Snapshot := {
@@ -75,14 +77,19 @@ public def State.snapshot (state : State) : Snapshot := {
   currentCall := state.currentCall
   safeTools := state.safeTools
   permissionMode := state.permissionMode
+  pendingSteers := state.pendingSteers
 }
+
+private def setDefaultField (json : Json) (name : String) (value : Json) : Json :=
+  match json.getObjVal? name with
+  | .ok _ => json
+  | .error _ => json.setObjVal! name value
 
 public def State.fromJsonWithDefaults (json : Json) : Except String State :=
   let migrated := match json with
     | .obj _ =>
-      match json.getObjVal? "permissionMode" with
-      | .ok _ => json
-      | .error _ => json.setObjVal! "permissionMode" (toJson "ask")
+      let withPermission := setDefaultField json "permissionMode" (toJson "ask")
+      setDefaultField withPermission "pendingSteers" (toJson (#[] : Array String))
     | _ => json
   fromJson? migrated
 

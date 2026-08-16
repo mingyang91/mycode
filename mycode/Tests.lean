@@ -81,6 +81,57 @@ private def testAbortClosesEveryPendingToolCall : IO Unit := do
   assert (resubmitted.phase.label == "waiting_model") "session must accept a prompt after abort"
   assert (nextEffects.size == 1 && nextEffects[0]!.kind == "request_model") "resubmit must request the model"
 
+private def testSteerRestartsWaitingModel : IO Unit := do
+  let (submitted, _) ← step {} { kind := "submit", text? := some "Use the old plan" }
+  let (steered, effects) ← step submitted { kind := "steer", text? := some "Use the new plan" }
+  assert (steered.phase.label == "waiting_model") "steer must keep the model phase active"
+  assert (effects.size == 1 && effects[0]!.kind == "request_model")
+    "steer during model work must request a replacement response"
+  assert (steered.messages.size == 2) "model steer must retain both user instructions"
+  assert (steered.messages[1]!.content == "Use the new plan") "steer text must enter the main transcript"
+  assert steered.pendingSteers.isEmpty "model steer must be consumed before the replacement request"
+
+private def testSteerFinishesCurrentToolAndSkipsTheRest : IO Unit := do
+  let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read"] }
+  let (submitted, _) ← step configured { kind := "submit", text? := some "Read both files" }
+  let (running, _) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[call "call-steer-current" "read", call "call-steer-skipped" "read"]
+  }
+  let (queued, steerEffects) ← step running { kind := "steer", text? := some "Read only the first file" }
+  assert steerEffects.isEmpty "steer must not interrupt a tool with an unknown outcome"
+  assert (queued.pendingSteers == #["Read only the first file"]) "tool steer must persist until the result arrives"
+  let (next, effects) ← step queued {
+    kind := "tool_completed"
+    callId? := some "call-steer-current"
+    content? := some "first contents"
+  }
+  assert (next.phase.label == "waiting_model") "tool steer must return control to the model"
+  assert (effects.size == 1 && effects[0]!.kind == "request_model") "tool steer must request the model once"
+  assert (next.pendingCalls.isEmpty && next.pendingSteers.isEmpty) "consumed steer state must be cleared"
+  assert (next.messages.size == 5) "tool steer must retain the result, skip, and instruction"
+  assert (next.messages[2]!.toolCallId? == some "call-steer-current" && !next.messages[2]!.isError)
+    "the running tool result must be retained"
+  assert (next.messages[3]!.toolCallId? == some "call-steer-skipped" && next.messages[3]!.isError)
+    "the remaining tool must receive a synthetic result"
+  assert (next.messages[4]!.role == "user" && next.messages[4]!.content == "Read only the first file")
+    "steer text must follow every tool result"
+
+private def testSteerReplacesPendingApproval : IO Unit := do
+  let (submitted, _) ← step {} { kind := "submit", text? := some "Change two files" }
+  let (approval, _) ← step submitted {
+    kind := "model_completed"
+    toolCalls := #[call "call-steer-denied-1" "write", call "call-steer-denied-2" "bash"]
+  }
+  let (steered, effects) ← step approval { kind := "steer", text? := some "Do not change files" }
+  assert (steered.phase.label == "waiting_model") "approval steer must resume the model"
+  assert (effects.size == 1 && effects[0]!.kind == "request_model") "approval steer must request the model"
+  assert (steered.messages.size == 5) "approval steer must close every proposed tool"
+  assert (steered.messages[2]!.isError && steered.messages[3]!.isError)
+    "approval steer must synthesize every missing tool result"
+  assert (steered.messages[4]!.role == "user" && steered.messages[4]!.content == "Do not change files")
+    "approval steer must append the new instruction after tool results"
+
 private def testReadOnlyGitUsesVerifiedEffect : IO Unit := do
   let (configured, _) ← step {} { kind := "configure_tools", safeTools := #["read", "git_read"] }
   let (submitted, _) ← step configured { kind := "submit", text? := some "Inspect the repository" }
@@ -213,13 +264,18 @@ private def testLegacySessionDefaultsToAsk : IO Unit := do
     ("safeTools", toJson (#[] : Array String))
   ]
   match State.fromJsonWithDefaults legacy with
-  | .ok state => assert (state.permissionMode == "ask") "legacy session must default to ask"
+  | .ok state =>
+    assert (state.permissionMode == "ask") "legacy session must default to ask"
+    assert state.pendingSteers.isEmpty "legacy session must default to no queued steer"
   | .error error => throw (IO.userError s!"legacy session failed to decode: {error}")
 def main : IO Unit := do
   testSafeToolFlowsDirectlyToExecutor
   testUnsafeToolNeedsApproval
   testDeniedToolReturnsToModel
   testAbortClosesEveryPendingToolCall
+  testSteerRestartsWaitingModel
+  testSteerFinishesCurrentToolAndSkipsTheRest
+  testSteerReplacesPendingApproval
   testReadOnlyGitUsesVerifiedEffect
   testMutatingGitRequiresApproval
   testCompoundGitFallsBackToBash
