@@ -54,11 +54,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const CORE_PROTOCOL_VERSION: u64 = 2;
+const CORE_PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a careful coding agent. Use the declared tools when needed. Explain changes briefly.";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BTW_SIDECHAIN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EDITOR_BYTES: usize = 128 * 1024;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const COLOR_ACCENT: Color = Color::Rgb(139, 92, 246);
 const COLOR_USER: Color = Color::Rgb(56, 189, 248);
@@ -182,6 +183,14 @@ enum AppError {
     SidechainVersion { path: PathBuf, version: u32 },
     #[error("could not determine a home directory for BTW sidechain storage")]
     MissingHomeDirectory,
+    #[error("external editor exited with status {status}")]
+    EditorFailed { status: std::process::ExitStatus },
+    #[error("edited content exceeded {limit} bytes")]
+    EditedContentTooLarge { limit: usize },
+    #[error("external editor produced non-UTF-8 text: {0}")]
+    EditorEncoding(#[from] std::string::FromUtf8Error),
+    #[error("invalid todo document at line {line}: {message}")]
+    TodoDocument { line: usize, message: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -196,7 +205,9 @@ enum SlashCommandError {
 enum SlashCommandKind {
     Btw,
     Exit,
+    Plan,
     Steer,
+    Todo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,7 +219,7 @@ struct SlashCommandSpec {
     takes_arguments: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommandSpec; 3] = [
+const SLASH_COMMANDS: [SlashCommandSpec; 5] = [
     SlashCommandSpec {
         name: "btw",
         usage: "/btw <question>",
@@ -224,11 +235,25 @@ const SLASH_COMMANDS: [SlashCommandSpec; 3] = [
         takes_arguments: false,
     },
     SlashCommandSpec {
+        name: "plan",
+        usage: "/plan <goal>",
+        description: "Research and submit a plan for review",
+        kind: SlashCommandKind::Plan,
+        takes_arguments: true,
+    },
+    SlashCommandSpec {
         name: "steer",
         usage: "/steer <instruction>",
         description: "Redirect the active main task",
         kind: SlashCommandKind::Steer,
         takes_arguments: true,
+    },
+    SlashCommandSpec {
+        name: "todo",
+        usage: "/todo",
+        description: "Edit the session todo list",
+        kind: SlashCommandKind::Todo,
+        takes_arguments: false,
     },
 ];
 
@@ -251,7 +276,9 @@ fn slash_command_candidates(input: &str) -> impl Iterator<Item = &'static SlashC
 enum SlashCommand {
     Btw(String),
     Exit,
+    Plan(String),
     Steer(String),
+    Todo,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -285,12 +312,22 @@ fn parse_submission(text: String) -> Result<UserSubmission, SlashCommandError> {
             Ok(UserSubmission::Command(SlashCommand::Exit))
         }
         SlashCommandKind::Exit => Err(SlashCommandError::InvalidUsage(spec.usage)),
+        SlashCommandKind::Plan if arguments.is_empty() => {
+            Err(SlashCommandError::InvalidUsage(spec.usage))
+        }
+        SlashCommandKind::Plan => Ok(UserSubmission::Command(SlashCommand::Plan(
+            arguments.to_owned(),
+        ))),
         SlashCommandKind::Steer if arguments.is_empty() => {
             Err(SlashCommandError::InvalidUsage(spec.usage))
         }
         SlashCommandKind::Steer => Ok(UserSubmission::Command(SlashCommand::Steer(
             arguments.to_owned(),
         ))),
+        SlashCommandKind::Todo if arguments.is_empty() => {
+            Ok(UserSubmission::Command(SlashCommand::Todo))
+        }
+        SlashCommandKind::Todo => Err(SlashCommandError::InvalidUsage(spec.usage)),
     }
 }
 
@@ -335,6 +372,43 @@ struct CoreMessage {
     is_error: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoreTodoItem {
+    content: String,
+    status: String,
+    #[serde(default)]
+    blocker: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoreTodoPhase {
+    name: String,
+    #[serde(default)]
+    tasks: Vec<CoreTodoItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CorePlanState {
+    enabled: bool,
+    revision: u64,
+    status: String,
+    content: String,
+}
+
+impl Default for CorePlanState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            revision: 0,
+            status: "none".to_owned(),
+            content: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CoreEvent {
@@ -355,6 +429,8 @@ struct CoreEvent {
     safe_tools: Vec<String>,
     #[serde(default = "default_permission_mode")]
     permission_mode: String,
+    #[serde(default)]
+    todos: Vec<CoreTodoPhase>,
 }
 
 fn default_permission_mode() -> String {
@@ -362,102 +438,112 @@ fn default_permission_mode() -> String {
 }
 
 impl CoreEvent {
-    fn configure_tools(safe_tools: Vec<String>, permission_mode: PermissionMode) -> Self {
+    fn new(kind: &str) -> Self {
         Self {
-            kind: "configure_tools".to_owned(),
+            kind: kind.to_owned(),
             text: None,
             tool_calls: Vec::new(),
             call_id: None,
             approved: None,
             content: None,
             is_error: None,
+            safe_tools: Vec::new(),
+            permission_mode: "ask".to_owned(),
+            todos: Vec::new(),
+        }
+    }
+
+    fn configure_tools(safe_tools: Vec<String>, permission_mode: PermissionMode) -> Self {
+        Self {
             safe_tools,
             permission_mode: permission_mode.wire_value().to_owned(),
+            ..Self::new("configure_tools")
         }
     }
 
     fn submit(text: String) -> Self {
         Self {
-            kind: "submit".to_owned(),
             text: Some(text),
-            tool_calls: Vec::new(),
-            call_id: None,
-            approved: None,
-            content: None,
-            is_error: None,
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            ..Self::new("submit")
+        }
+    }
+
+    fn enter_plan(text: String) -> Self {
+        Self {
+            text: Some(text),
+            ..Self::new("enter_plan")
         }
     }
 
     fn steer(text: String) -> Self {
         Self {
-            kind: "steer".to_owned(),
             text: Some(text),
-            tool_calls: Vec::new(),
-            call_id: None,
-            approved: None,
-            content: None,
-            is_error: None,
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            ..Self::new("steer")
         }
     }
 
     fn model_completed(content: String, tool_calls: Vec<CoreToolCall>) -> Self {
         Self {
-            kind: "model_completed".to_owned(),
-            text: None,
             tool_calls,
-            call_id: None,
-            approved: None,
             content: Some(content),
-            is_error: None,
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            ..Self::new("model_completed")
         }
     }
 
     fn approval(call_id: String, approved: bool) -> Self {
         Self {
-            kind: "approval_result".to_owned(),
-            text: None,
-            tool_calls: Vec::new(),
             call_id: Some(call_id),
             approved: Some(approved),
-            content: None,
-            is_error: None,
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            ..Self::new("approval_result")
         }
     }
 
     fn tool_completed(call_id: String, content: String, is_error: bool) -> Self {
         Self {
-            kind: "tool_completed".to_owned(),
-            text: None,
-            tool_calls: Vec::new(),
             call_id: Some(call_id),
-            approved: None,
             content: Some(content),
             is_error: Some(is_error),
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            ..Self::new("tool_completed")
+        }
+    }
+
+    fn replace_todos(todos: Vec<CoreTodoPhase>) -> Self {
+        Self {
+            todos,
+            ..Self::new("replace_todos")
+        }
+    }
+
+    fn approve_plan() -> Self {
+        Self {
+            approved: Some(true),
+            ..Self::new("plan_review_result")
+        }
+    }
+
+    fn refine_plan(feedback: String) -> Self {
+        Self {
+            text: Some(feedback),
+            ..Self::new("plan_review_result")
+        }
+    }
+
+    fn edit_plan(content: String) -> Self {
+        Self {
+            content: Some(content),
+            ..Self::new("plan_review_result")
+        }
+    }
+
+    fn cancel_plan_review() -> Self {
+        Self {
+            approved: Some(false),
+            ..Self::new("plan_review_result")
         }
     }
 
     fn abort() -> Self {
-        Self {
-            kind: "abort".to_owned(),
-            text: None,
-            tool_calls: Vec::new(),
-            call_id: None,
-            approved: None,
-            content: None,
-            is_error: None,
-            safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
-        }
+        Self::new("abort")
     }
 }
 
@@ -484,6 +570,10 @@ struct CoreSnapshot {
     permission_mode: String,
     #[serde(default)]
     pending_steers: Vec<String>,
+    #[serde(default)]
+    plan: CorePlanState,
+    #[serde(default)]
+    todos: Vec<CoreTodoPhase>,
 }
 
 fn snapshot_accepts_steer(snapshot: &CoreSnapshot) -> bool {
@@ -979,7 +1069,7 @@ enum ProviderError {
     MissingCompletion,
     #[error("provider supplied malformed tool arguments")]
     InvalidToolArguments,
-    #[error("provider generated a tool name not declared by a plugin")]
+    #[error("provider generated an undeclared tool name")]
     UnknownTool,
     #[error("missing {provider} API key in {environment}")]
     MissingApiKey {
@@ -1049,10 +1139,42 @@ impl ModelClient {
         })
     }
 
+    fn rendered_system_prompt(&self, snapshot: &CoreSnapshot) -> String {
+        let mut prompt = self.system_prompt.clone();
+        prompt.push_str(
+            "\n\nUse the todo tool for work with three or more distinct steps. Keep its phases and statuses current.",
+        );
+        if snapshot.plan.enabled {
+            prompt.push_str(
+                "\n\nPLAN MODE IS ACTIVE. Research without changing workspace state. Read and search freely, but do not call write, edit, or mutating shell commands. Update the structured todo list as you learn. Use the plan tool with op=update while drafting and op=propose only when the full Markdown plan is ready for human review.",
+            );
+        }
+        if !snapshot.plan.content.is_empty() {
+            prompt.push_str(&format!(
+                "\n\nCurrent plan revision {} ({})\n{}",
+                snapshot.plan.revision, snapshot.plan.status, snapshot.plan.content
+            ));
+        }
+        if !snapshot.todos.is_empty() {
+            prompt.push_str("\n\nCurrent todo state:");
+            for phase in &snapshot.todos {
+                prompt.push_str(&format!("\n## {}", phase.name));
+                for task in &phase.tasks {
+                    prompt.push_str(&format!("\n- [{}] {}", task.status, task.content));
+                    if let Some(blocker) = &task.blocker {
+                        prompt.push_str(&format!(" ({blocker})"));
+                    }
+                }
+            }
+        }
+        prompt
+    }
+
     async fn complete(
         &self,
         snapshot: &CoreSnapshot,
         tools: &[ToolSpec],
+        declared_tools: &[ToolSpec],
     ) -> Result<ModelCompletion, ProviderError> {
         let completion = match self.provider {
             Provider::Openai | Provider::Linewise => self.complete_openai(snapshot, tools).await?,
@@ -1061,7 +1183,7 @@ impl ModelClient {
         if completion
             .tool_calls
             .iter()
-            .any(|call| !tools.iter().any(|tool| tool.name == call.name))
+            .any(|call| !declared_tools.iter().any(|tool| tool.name == call.name))
         {
             return Err(ProviderError::UnknownTool);
         }
@@ -1097,7 +1219,7 @@ impl ModelClient {
             content: question.to_owned(),
             ..CoreMessage::default()
         });
-        let completion = self.complete(&side_snapshot, &[]).await?;
+        let completion = self.complete(&side_snapshot, &[], &[]).await?;
         Ok(completion.content)
     }
 
@@ -1106,7 +1228,8 @@ impl ModelClient {
         snapshot: &CoreSnapshot,
         tools: &[ToolSpec],
     ) -> Result<ModelCompletion, ProviderError> {
-        let mut messages = vec![json!({"role": "system", "content": self.system_prompt})];
+        let system_prompt = self.rendered_system_prompt(snapshot);
+        let mut messages = vec![json!({"role": "system", "content": system_prompt})];
         for message in &snapshot.messages {
             match message.role.as_str() {
                 "user" => messages.push(json!({"role": "user", "content": message.content})),
@@ -1201,6 +1324,7 @@ impl ModelClient {
         snapshot: &CoreSnapshot,
         tools: &[ToolSpec],
     ) -> Result<ModelCompletion, ProviderError> {
+        let system_prompt = self.rendered_system_prompt(snapshot);
         let messages = anthropic_messages(&snapshot.messages);
         let tools: Vec<Value> = tools
             .iter()
@@ -1215,7 +1339,7 @@ impl ModelClient {
         let mut request = json!({
             "model": self.model,
             "max_tokens": 4096,
-            "system": self.system_prompt,
+            "system": system_prompt,
             "messages": messages
         });
         if !tools.is_empty() {
@@ -2172,6 +2296,8 @@ struct App {
     status: String,
     snapshot: CoreSnapshot,
     approval: Option<CoreToolCall>,
+    plan_review: bool,
+    plan_feedback: bool,
     busy: bool,
     scroll_offset: usize,
     max_scroll: usize,
@@ -2195,6 +2321,8 @@ impl App {
             status: "Ready".to_owned(),
             snapshot,
             approval: None,
+            plan_review: false,
+            plan_feedback: false,
             busy: false,
             scroll_offset: 0,
             max_scroll: 0,
@@ -2214,7 +2342,10 @@ impl App {
     }
 
     fn slash_menu_visible(&self) -> bool {
-        !self.slash_menu_dismissed && self.slash_candidate_count() > 0
+        !self.plan_review
+            && !self.plan_feedback
+            && !self.slash_menu_dismissed
+            && self.slash_candidate_count() > 0
     }
 
     fn input_changed(&mut self) {
@@ -2391,6 +2522,33 @@ impl App {
         Text::from(visible)
     }
 
+    fn visible_plan(&mut self, width: u16, height: u16) -> Text<'static> {
+        let mut lines = Vec::new();
+        for source in self.snapshot.plan.content.lines() {
+            let style = if source.starts_with('#') {
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_TEXT)
+            };
+            push_wrapped_line(&mut lines, source, style, width.max(1));
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No plan content.",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+        self.max_scroll = lines.len().saturating_sub(usize::from(height));
+        self.page_rows = usize::from(height.max(1));
+        self.follow_tail = false;
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll);
+        let start = self.scroll_offset.min(lines.len());
+        let end = start.saturating_add(usize::from(height)).min(lines.len());
+        Text::from(lines[start..end].to_vec())
+    }
+
     fn scroll_up(&mut self, rows: usize) {
         if self.max_scroll == 0 {
             return;
@@ -2452,8 +2610,18 @@ impl App {
     }
 }
 
+enum PlanReviewAction {
+    Approve,
+    Refine(String),
+    Edit(String),
+    Cancel,
+}
+
 enum RuntimeAction {
     Submit(String),
+    EnterPlan(String),
+    ReplaceTodos(Vec<CoreTodoPhase>),
+    PlanReview(PlanReviewAction),
     Btw {
         question: String,
         snapshot: CoreSnapshot,
@@ -2490,6 +2658,7 @@ struct RuntimeFinal {
     snapshot: CoreSnapshot,
     status: String,
     approval: Option<CoreToolCall>,
+    plan_review: bool,
     local_entry: Option<LocalTranscriptEntry>,
 }
 
@@ -2498,15 +2667,26 @@ enum KeyAction {
     Quit,
     Cancel,
     Submit(String),
+    EnterPlan(String),
+    EditTodos,
+    PlanReview(PlanReviewAction),
+    EditPlan,
     Steer(String),
     Btw(String),
     Approval { call_id: String, approved: bool },
+}
+
+struct ModelToolCatalogs {
+    normal: Vec<ToolSpec>,
+    plan: Vec<ToolSpec>,
+    declared: Vec<ToolSpec>,
 }
 
 struct RuntimeResources {
     core: CoreClient,
     plugins: PluginManager,
     provider: ModelClient,
+    model_tools: ModelToolCatalogs,
     desired_safe_tools: Vec<String>,
     desired_permission_mode: PermissionMode,
     sidechain: BtwSidechainStore,
@@ -2542,6 +2722,93 @@ fn automatically_safe_tool_names(tools: &[ToolSpec]) -> Vec<String> {
         .collect()
 }
 
+fn todo_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "todo".to_owned(),
+        description: "Maintain the session task list. Use it for work with three or more distinct steps and update status as work changes.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["init", "append", "start", "done", "drop", "block", "unblock", "rm", "view"]},
+                "phases": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "minLength": 1, "maxLength": 200},
+                            "tasks": {
+                                "type": "array",
+                                "maxItems": 64,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {"type": "string", "minLength": 1, "maxLength": 200},
+                                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "abandoned", "blocked"]},
+                                        "blocker": {"type": "string", "minLength": 1, "maxLength": 200}
+                                    },
+                                    "required": ["content", "status"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["name", "tasks"],
+                        "additionalProperties": false
+                    }
+                },
+                "task": {"type": "string", "minLength": 1, "maxLength": 200},
+                "phase": {"type": "string", "minLength": 1, "maxLength": 200},
+                "items": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 200}
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn plan_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "plan".to_owned(),
+        description: "Update the Markdown implementation plan during plan mode. Use op=update while drafting and op=propose when it is ready for human review.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["update", "propose"]},
+                "content": {"type": "string", "minLength": 1, "maxLength": 65536}
+            },
+            "required": ["op", "content"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn model_tool_catalogs(plugin_tools: &[ToolSpec]) -> ModelToolCatalogs {
+    let todo = todo_tool_spec();
+    let plan = plan_tool_spec();
+
+    let mut normal = plugin_tools.to_vec();
+    normal.push(todo.clone());
+
+    let mut plan_mode = plugin_tools
+        .iter()
+        .filter(|tool| matches!(tool.name.as_str(), "read" | "grep" | "bash"))
+        .cloned()
+        .collect::<Vec<_>>();
+    plan_mode.push(todo.clone());
+    plan_mode.push(plan.clone());
+
+    let mut declared = plugin_tools.to_vec();
+    declared.push(todo);
+    declared.push(plan);
+
+    ModelToolCatalogs {
+        normal,
+        plan: plan_mode,
+        declared,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     install_terminal_panic_hook();
@@ -2565,6 +2832,7 @@ async fn main() -> Result<(), AppError> {
         .unwrap_or_else(default_git_plugin_path);
     let mut core = CoreClient::spawn(&core_path, session.as_deref()).await?;
     let plugins = PluginManager::spawn(&args.plugin, &git_plugin_path).await?;
+    let model_tools = model_tool_catalogs(plugins.model_tools());
     let mut safe_tools = automatically_safe_tool_names(plugins.model_tools());
     if plugins.has_tool("git_read") {
         safe_tools.push("git_read".to_owned());
@@ -2632,6 +2900,16 @@ async fn main() -> Result<(), AppError> {
                 .await?;
             Some(RuntimeAction::Drive(interrupted))
         }
+        "waiting_plan_review" => {
+            if args.prompt.is_some() {
+                return Err(AppError::PromptWhileResuming {
+                    phase: app.snapshot.phase.clone(),
+                });
+            }
+            app.plan_review = true;
+            app.status = "Plan ready · y approve · r refine · e edit · n cancel".to_owned();
+            None
+        }
         phase => {
             return Err(AppError::UnsupportedSessionPhase {
                 phase: phase.to_owned(),
@@ -2642,6 +2920,7 @@ async fn main() -> Result<(), AppError> {
         core,
         plugins,
         provider,
+        model_tools,
         desired_safe_tools: safe_tools,
         desired_permission_mode,
         sidechain,
@@ -2664,6 +2943,187 @@ fn active_pending_call(snapshot: &CoreSnapshot) -> Result<CoreToolCall, AppError
         .get(index)
         .cloned()
         .ok_or(AppError::MissingPendingTool { phase })
+}
+
+fn todos_to_markdown(phases: &[CoreTodoPhase]) -> String {
+    let mut output = String::new();
+    for phase in phases {
+        output.push_str("## ");
+        output.push_str(&phase.name);
+        output.push('\n');
+        for task in &phase.tasks {
+            let marker = match task.status.as_str() {
+                "in_progress" => ">",
+                "completed" => "x",
+                "abandoned" => "-",
+                "blocked" => "!",
+                _ => " ",
+            };
+            output.push_str(&format!("- [{marker}] {}", task.content));
+            if let Some(blocker) = &task.blocker {
+                output.push_str(&format!(" <!-- blocker: {blocker} -->"));
+            }
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn parse_todos_markdown(document: &str) -> Result<Vec<CoreTodoPhase>, AppError> {
+    let mut phases: Vec<CoreTodoPhase> = Vec::new();
+    let mut phase_names = BTreeMap::new();
+    let mut task_names = BTreeMap::new();
+    let mut task_count = 0_usize;
+
+    for (index, raw_line) in document.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("## ") {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 200 {
+                return Err(AppError::TodoDocument {
+                    line: line_number,
+                    message: "phase name must contain 1-200 characters".to_owned(),
+                });
+            }
+            if phases.len() >= 16 {
+                return Err(AppError::TodoDocument {
+                    line: line_number,
+                    message: "todo list may contain at most 16 phases".to_owned(),
+                });
+            }
+            if phase_names.insert(name.to_owned(), ()).is_some() {
+                return Err(AppError::TodoDocument {
+                    line: line_number,
+                    message: format!("duplicate phase `{name}`"),
+                });
+            }
+            phases.push(CoreTodoPhase {
+                name: name.to_owned(),
+                tasks: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(phase) = phases.last_mut() else {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: "task appears before a `## Phase` heading".to_owned(),
+            });
+        };
+        let (status, remainder) = if let Some(content) = line.strip_prefix("- [ ] ") {
+            ("pending", content)
+        } else if let Some(content) = line.strip_prefix("- [>] ") {
+            ("in_progress", content)
+        } else if let Some(content) = line.strip_prefix("- [x] ") {
+            ("completed", content)
+        } else if let Some(content) = line.strip_prefix("- [-] ") {
+            ("abandoned", content)
+        } else if let Some(content) = line.strip_prefix("- [!] ") {
+            ("blocked", content)
+        } else {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: "expected `- [ ]`, `- [>]`, `- [x]`, `- [-]`, or `- [!]`".to_owned(),
+            });
+        };
+        let (content, blocker) = match remainder
+            .strip_suffix(" -->")
+            .and_then(|text| text.rsplit_once(" <!-- blocker: "))
+        {
+            Some((content, blocker)) => (content.trim(), Some(blocker.trim().to_owned())),
+            None => (remainder.trim(), None),
+        };
+        if content.is_empty() || content.chars().count() > 200 {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: "task content must contain 1-200 characters".to_owned(),
+            });
+        }
+        if blocker
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.chars().count() > 200)
+        {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: "blocker must contain 1-200 characters".to_owned(),
+            });
+        }
+        if task_names.insert(content.to_owned(), ()).is_some() {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: format!("duplicate task `{content}`"),
+            });
+        }
+        task_count += 1;
+        if task_count > 64 {
+            return Err(AppError::TodoDocument {
+                line: line_number,
+                message: "todo list may contain at most 64 tasks".to_owned(),
+            });
+        }
+        phase.tasks.push(CoreTodoItem {
+            content: content.to_owned(),
+            status: status.to_owned(),
+            blocker,
+        });
+    }
+    Ok(phases)
+}
+
+async fn edit_text_in_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    initial: &str,
+    suffix: &str,
+) -> Result<String, AppError> {
+    let path = env::temp_dir().join(format!("mycode-{}-{suffix}.md", Uuid::new_v4().simple()));
+    tokio::fs::write(&path, initial.as_bytes()).await?;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+
+    let editor = env::var_os("VISUAL")
+        .or_else(|| env::var_os("EDITOR"))
+        .unwrap_or_else(|| "vi".into());
+    let status_result = Command::new(editor).arg(&path).status().await;
+    let content_result = async {
+        let file = tokio::fs::File::open(&path).await?;
+        let mut bytes = Vec::new();
+        file.take((MAX_EDITOR_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_EDITOR_BYTES {
+            return Err(AppError::EditedContentTooLarge {
+                limit: MAX_EDITOR_BYTES,
+            });
+        }
+        Ok(String::from_utf8(bytes)?)
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&path).await;
+
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+
+    let status = status_result?;
+    if !status.success() {
+        return Err(AppError::EditorFailed { status });
+    }
+    content_result
 }
 
 struct TerminalRestore;
@@ -2769,6 +3229,63 @@ async fn tui_loop(
                                     updates.clone(),
                                 ));
                             }
+                            KeyAction::EnterPlan(text) if active.is_none() => {
+                                app.busy = true;
+                                app.status = "Entering plan mode…".to_owned();
+                                active = Some(spawn_runtime_action(
+                                    Arc::clone(&runtime),
+                                    RuntimeAction::EnterPlan(text),
+                                    updates.clone(),
+                                ));
+                            }
+                            KeyAction::EditTodos if active.is_none() => {
+                                let initial = todos_to_markdown(&app.snapshot.todos);
+                                match edit_text_in_external_editor(terminal, &initial, "todos").await {
+                                    Ok(document) => match parse_todos_markdown(&document) {
+                                        Ok(todos) => {
+                                            app.busy = true;
+                                            app.status = "Saving todos…".to_owned();
+                                            active = Some(spawn_runtime_action(
+                                                Arc::clone(&runtime),
+                                                RuntimeAction::ReplaceTodos(todos),
+                                                updates.clone(),
+                                            ));
+                                        }
+                                        Err(error) => app.status = format!("Error: {error}"),
+                                    },
+                                    Err(error) => app.status = format!("Error: {error}"),
+                                }
+                            }
+                            KeyAction::EditPlan if active.is_none() => {
+                                let initial = app.snapshot.plan.content.clone();
+                                match edit_text_in_external_editor(terminal, &initial, "plan").await {
+                                    Ok(content) if content != initial => {
+                                        app.busy = true;
+                                        app.plan_review = false;
+                                        app.status = "Saving plan revision…".to_owned();
+                                        active = Some(spawn_runtime_action(
+                                            Arc::clone(&runtime),
+                                            RuntimeAction::PlanReview(PlanReviewAction::Edit(content)),
+                                            updates.clone(),
+                                        ));
+                                    }
+                                    Ok(_) => app.status =
+                                        "Plan unchanged · y approve · r refine · e edit · n cancel".to_owned(),
+                                    Err(error) => app.status = format!("Error: {error}"),
+                                }
+                            }
+                            KeyAction::PlanReview(action) if active.is_none() => {
+                                app.busy = true;
+                                app.plan_review = false;
+                                app.plan_feedback = false;
+                                app.follow_tail = true;
+                                app.status = "Applying plan decision…".to_owned();
+                                active = Some(spawn_runtime_action(
+                                    Arc::clone(&runtime),
+                                    RuntimeAction::PlanReview(action),
+                                    updates.clone(),
+                                ));
+                            }
                             KeyAction::Btw(question) if active.is_none() => {
                                 app.busy = true;
                                 app.status = "Asking BTW…".to_owned();
@@ -2791,7 +3308,13 @@ async fn tui_loop(
                                     updates.clone(),
                                 ));
                             }
-                            KeyAction::Submit(_) | KeyAction::Btw(_) | KeyAction::Approval { .. } => {}
+                            KeyAction::Submit(_)
+                            | KeyAction::EnterPlan(_)
+                            | KeyAction::EditTodos
+                            | KeyAction::PlanReview(_)
+                            | KeyAction::EditPlan
+                            | KeyAction::Btw(_)
+                            | KeyAction::Approval { .. } => {}
                         }
                     }
                     CrosstermEvent::Mouse(mouse) => {
@@ -2836,14 +3359,21 @@ async fn tui_loop(
                             snapshot,
                             status,
                             approval,
+                            plan_review,
                             local_entry,
                         } = final_state;
+                        if plan_review && !app.plan_review {
+                            app.scroll_offset = 0;
+                            app.follow_tail = false;
+                        }
                         app.set_snapshot(snapshot);
                         if let Some(entry) = local_entry {
                             app.push_local_entry(entry);
                         }
                         app.status = status;
                         app.approval = approval;
+                        app.plan_review = plan_review;
+                        app.plan_feedback = false;
                         app.busy = false;
                         app.clear_live_tool();
                         dirty = true;
@@ -2854,6 +3384,8 @@ async fn tui_loop(
                         }
                         app.status = format!("Error: {error}");
                         app.busy = false;
+                        app.plan_review = app.snapshot.phase == "waiting_plan_review";
+                        app.plan_feedback = false;
                         app.clear_live_tool();
                         dirty = true;
                     }
@@ -2879,6 +3411,49 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('o')) {
         app.toggle_transcript_details();
         return KeyAction::None;
+    }
+    if app.plan_review {
+        if app.plan_feedback {
+            return match key.code {
+                KeyCode::Enter if !app.input.trim().is_empty() => {
+                    let feedback = app.input.trim().to_owned();
+                    app.clear_input();
+                    app.plan_feedback = false;
+                    KeyAction::PlanReview(PlanReviewAction::Refine(feedback))
+                }
+                KeyCode::Backspace => {
+                    app.pop_input_character();
+                    KeyAction::None
+                }
+                KeyCode::Esc => {
+                    app.clear_input();
+                    app.plan_feedback = false;
+                    app.status = "Plan ready · y approve · r refine · e edit · n cancel".to_owned();
+                    KeyAction::None
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.push_input_character(character);
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyAction::PlanReview(PlanReviewAction::Approve)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                app.plan_feedback = true;
+                app.clear_input();
+                app.status = "Describe the plan changes, then press Enter".to_owned();
+                KeyAction::None
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => KeyAction::EditPlan,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyAction::PlanReview(PlanReviewAction::Cancel)
+            }
+            _ => KeyAction::None,
+        };
     }
     if app.approval.is_none() {
         match key.code {
@@ -2953,6 +3528,25 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
                         KeyAction::Steer(instruction)
                     } else {
                         app.status = "Error: no active main task to steer".to_owned();
+                        KeyAction::None
+                    }
+                }
+                Ok(UserSubmission::Command(SlashCommand::Plan(goal))) => {
+                    app.clear_input();
+                    if app.snapshot.phase == "idle" && !app.busy {
+                        KeyAction::EnterPlan(goal)
+                    } else {
+                        app.status = "Error: plan mode can start only while idle".to_owned();
+                        KeyAction::None
+                    }
+                }
+                Ok(UserSubmission::Command(SlashCommand::Todo)) => {
+                    app.clear_input();
+                    if app.snapshot.phase == "idle" && !app.busy {
+                        KeyAction::EditTodos
+                    } else {
+                        app.status =
+                            "Error: todos can be edited directly only while idle".to_owned();
                         KeyAction::None
                     }
                 }
@@ -3046,6 +3640,7 @@ async fn run_runtime_action(
                         snapshot,
                         status: "BTW cancelled".to_owned(),
                         approval: None,
+                        plan_review: false,
                         local_entry: None,
                     });
                 }
@@ -3061,11 +3656,30 @@ async fn run_runtime_action(
                 snapshot,
                 status: "Ready".to_owned(),
                 approval: None,
+                plan_review: false,
                 local_entry: Some(entry),
             })
         }
         RuntimeAction::Submit(text) => {
             let response = runtime.core.event(&CoreEvent::submit(text)).await?;
+            drive_response(response, &mut runtime, updates, cancel, steer).await
+        }
+        RuntimeAction::EnterPlan(text) => {
+            let response = runtime.core.event(&CoreEvent::enter_plan(text)).await?;
+            drive_response(response, &mut runtime, updates, cancel, steer).await
+        }
+        RuntimeAction::ReplaceTodos(todos) => {
+            let response = runtime.core.event(&CoreEvent::replace_todos(todos)).await?;
+            drive_response(response, &mut runtime, updates, cancel, steer).await
+        }
+        RuntimeAction::PlanReview(action) => {
+            let event = match action {
+                PlanReviewAction::Approve => CoreEvent::approve_plan(),
+                PlanReviewAction::Refine(feedback) => CoreEvent::refine_plan(feedback),
+                PlanReviewAction::Edit(content) => CoreEvent::edit_plan(content),
+                PlanReviewAction::Cancel => CoreEvent::cancel_plan_review(),
+            };
+            let response = runtime.core.event(&event).await?;
             drive_response(response, &mut runtime, updates, cancel, steer).await
         }
         RuntimeAction::Steer(text) => {
@@ -3114,7 +3728,15 @@ async fn drive_response(
                             send_runtime_progress(updates, &snapshot, "Steering…");
                             continue;
                         }
-                        result = runtime.provider.complete(&snapshot, runtime.plugins.model_tools()) => result?,
+                        result = runtime.provider.complete(
+                            &snapshot,
+                            if snapshot.plan.enabled {
+                                &runtime.model_tools.plan
+                            } else {
+                                &runtime.model_tools.normal
+                            },
+                            &runtime.model_tools.declared,
+                        ) => result?,
                     };
                     let next = runtime
                         .core
@@ -3142,6 +3764,16 @@ async fn drive_response(
                         snapshot,
                         status: format!("Approve {}? [y]es / [n]o", call.display_label()),
                         approval: Some(call),
+                        plan_review: false,
+                        local_entry: None,
+                    });
+                }
+                "request_plan_review" => {
+                    return Ok(RuntimeFinal {
+                        snapshot,
+                        status: "Plan ready · y approve · r refine · e edit · n cancel".to_owned(),
+                        approval: None,
+                        plan_review: true,
                         local_entry: None,
                     });
                 }
@@ -3213,10 +3845,12 @@ async fn drive_response(
         send_runtime_progress(updates, &snapshot, "Steering…");
     }
     apply_desired_permissions(runtime, &mut snapshot).await?;
+    let plan_review = snapshot.phase == "waiting_plan_review";
     Ok(RuntimeFinal {
         snapshot,
         status: "Ready".to_owned(),
         approval: None,
+        plan_review,
         local_entry: None,
     })
 }
@@ -3243,6 +3877,7 @@ async fn cancel_runtime(runtime: &mut RuntimeResources) -> Result<RuntimeFinal, 
         snapshot,
         status: "Cancelled".to_owned(),
         approval: None,
+        plan_review: false,
         local_entry: None,
     })
 }
@@ -3344,6 +3979,64 @@ fn slash_candidate_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn todo_panel_lines(snapshot: &CoreSnapshot, width: u16) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(2).max(1);
+    let mut lines = Vec::new();
+    if snapshot.plan.status != "none" {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Plan r{} · {}",
+                snapshot.plan.revision, snapshot.plan.status
+            ),
+            Style::default()
+                .fg(if snapshot.plan.enabled {
+                    COLOR_ACCENT
+                } else {
+                    COLOR_MUTED
+                })
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+    }
+    for phase in &snapshot.todos {
+        lines.push(Line::from(Span::styled(
+            phase.name.clone(),
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+        )));
+        for task in &phase.tasks {
+            let (marker, color) = match task.status.as_str() {
+                "in_progress" => (">", COLOR_ACCENT),
+                "completed" => ("x", COLOR_ASSISTANT),
+                "abandoned" => ("-", COLOR_MUTED),
+                "blocked" => ("!", COLOR_ERROR),
+                _ => (" ", COLOR_MUTED),
+            };
+            push_wrapped_line(
+                &mut lines,
+                &format!("[{marker}] {}", task.content),
+                Style::default().fg(color),
+                content_width,
+            );
+            if let Some(blocker) = &task.blocker {
+                push_wrapped_line(
+                    &mut lines,
+                    &format!("    blocked: {blocker}"),
+                    Style::default().fg(COLOR_ERROR),
+                    content_width,
+                );
+            }
+        }
+        lines.push(Line::default());
+    }
+    if snapshot.todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No todos. Run /todo or let the agent create them.",
+            Style::default().fg(COLOR_MUTED),
+        )));
+    }
+    lines
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
     let candidate_count = if app.approval.is_none() && app.slash_menu_visible() {
@@ -3376,39 +4069,99 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let phase_color = match app.snapshot.phase.as_str() {
         "idle" => COLOR_ASSISTANT,
-        "waiting_approval" => COLOR_TOOL,
+        "waiting_approval" | "waiting_plan_review" => COLOR_TOOL,
         "waiting_model" | "waiting_tool" => COLOR_ACCENT,
         _ => COLOR_MUTED,
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " mycode ",
-                Style::default()
-                    .fg(COLOR_TEXT)
-                    .bg(COLOR_ACCENT)
-                    .add_modifier(Modifier::BOLD),
+    let mut header_spans = vec![
+        Span::styled(
+            " mycode ",
+            Style::default()
+                .fg(COLOR_TEXT)
+                .bg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            app.snapshot.phase.clone(),
+            Style::default()
+                .fg(phase_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if app.snapshot.plan.status != "none" {
+        header_spans.push(Span::styled(
+            format!(
+                "  plan r{} · {}",
+                app.snapshot.plan.revision, app.snapshot.plan.status
             ),
-            Span::raw("  "),
-            Span::styled(
-                app.snapshot.phase.clone(),
-                Style::default()
-                    .fg(phase_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        header,
-    );
+            Style::default().fg(if app.snapshot.plan.enabled {
+                COLOR_ACCENT
+            } else {
+                COLOR_MUTED
+            }),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
-    let content_width = transcript.width.saturating_sub(2);
-    let content_height = transcript.height;
-    let visible_transcript = app.visible_transcript(content_width, content_height);
-    app.transcript_top = transcript.y;
-    app.transcript_bottom = transcript.y.saturating_add(transcript.height);
-    frame.render_widget(
-        Paragraph::new(visible_transcript).block(Block::default().padding(Padding::horizontal(1))),
-        transcript,
-    );
+    let show_todos = !app.snapshot.todos.is_empty() && transcript.width >= 72;
+    let mut main_area = transcript;
+    let mut todo_area = None;
+    if show_todos {
+        let sidebar_width = (transcript.width / 3).clamp(26, 40);
+        let areas = Layout::horizontal([Constraint::Min(40), Constraint::Length(sidebar_width)])
+            .split(transcript);
+        main_area = areas[0];
+        todo_area = Some(areas[1]);
+    }
+
+    app.transcript_top = main_area.y;
+    app.transcript_bottom = main_area.y.saturating_add(main_area.height);
+    if app.plan_review {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_ACCENT))
+            .title(Span::styled(
+                " Plan review · y approve · r refine · e edit · n cancel ",
+                Style::default()
+                    .fg(COLOR_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(main_area);
+        let visible_plan = app.visible_plan(inner.width, inner.height);
+        frame.render_widget(
+            Paragraph::new(visible_plan)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            main_area,
+        );
+    } else {
+        let content_width = main_area.width.saturating_sub(2);
+        let content_height = main_area.height;
+        let visible_transcript = app.visible_transcript(content_width, content_height);
+        frame.render_widget(
+            Paragraph::new(visible_transcript)
+                .block(Block::default().padding(Padding::horizontal(1))),
+            main_area,
+        );
+    }
+    if let Some(todo_area) = todo_area {
+        frame.render_widget(
+            Paragraph::new(todo_panel_lines(&app.snapshot, todo_area.width))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT)
+                        .border_style(Style::default().fg(COLOR_MUTED))
+                        .title(Span::styled(
+                            " Todos · /todo edit ",
+                            Style::default().fg(COLOR_MUTED),
+                        )),
+                ),
+            todo_area,
+        );
+    }
     if candidate_height > 0 {
         let candidate_rows = usize::from(candidates.height.saturating_sub(2));
         frame.render_widget(
@@ -3436,6 +4189,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             COLOR_TOOL,
         ),
+        None if app.plan_feedback => (
+            " Plan feedback · Enter submit · Esc return to review ".to_owned(),
+            COLOR_ACCENT,
+        ),
+        None if app.plan_review => (" Plan review · use y / r / e / n ".to_owned(), COLOR_ACCENT),
         None if app.busy && snapshot_accepts_steer(&app.snapshot) => (
             " Message · Enter steer · Esc cancel ".to_owned(),
             COLOR_ACCENT,
@@ -3491,8 +4249,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             ),
             Span::styled(
                 format!(
-                    " · pending {} · steer {} · safe {} · permission {}{scroll}{details}",
+                    " · pending {} · todos {} · steer {} · safe {} · permission {}{scroll}{details}",
                     app.snapshot.pending_calls.len(),
+                    app.snapshot.todos.iter().map(|phase| phase.tasks.len()).sum::<usize>(),
                     app.snapshot.pending_steers.len(),
                     app.snapshot.safe_tools.len(),
                     app.snapshot.permission_mode
@@ -3533,12 +4292,13 @@ mod tests {
 
     use super::{
         App, Args, BtwSidechainStore, COLOR_ACCENT, COLOR_ASSISTANT_BACKGROUND, COLOR_MUTED,
-        COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CoreSnapshot, CoreToolCall, KeyAction,
-        LiveToolOutput, LocalTranscriptEntry, PermissionMode, SlashCommand, SlashCommandError,
-        ToolOutputStream, ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
+        COLOR_USER_BACKGROUND, CoreEvent, CoreMessage, CorePlanState, CoreSnapshot, CoreTodoItem,
+        CoreTodoPhase, CoreToolCall, KeyAction, LiveToolOutput, LocalTranscriptEntry,
+        PermissionMode, PlanReviewAction, SlashCommand, SlashCommandError, ToolOutputStream,
+        ToolSpec, TranscriptLayoutCache, UserSubmission, anthropic_messages,
         automatically_safe_tool_names, btw_sidechain_path, build_live_tool_lines,
-        build_transcript_lines, draw, handle_key, parse_openai_tool_calls, parse_submission,
-        startup_permission_mode,
+        build_transcript_lines, draw, handle_key, model_tool_catalogs, parse_openai_tool_calls,
+        parse_submission, parse_todos_markdown, startup_permission_mode, todos_to_markdown,
     };
 
     #[test]
@@ -3567,6 +4327,35 @@ mod tests {
         assert_eq!(
             automatically_safe_tool_names(&tools),
             vec!["read".to_owned(), "grep".to_owned()]
+        );
+    }
+
+    #[test]
+    fn built_in_tools_have_separate_normal_and_plan_catalogues() {
+        let plugin_tools = ["read", "write", "bash"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            })
+            .collect::<Vec<_>>();
+        let catalogues = model_tool_catalogs(&plugin_tools);
+        fn names(tools: &[ToolSpec]) -> Vec<&str> {
+            tools.iter().map(|tool| tool.name.as_str()).collect()
+        }
+
+        assert_eq!(
+            names(&catalogues.normal),
+            vec!["read", "write", "bash", "todo"]
+        );
+        assert_eq!(
+            names(&catalogues.plan),
+            vec!["read", "bash", "todo", "plan"]
+        );
+        assert_eq!(
+            names(&catalogues.declared),
+            vec!["read", "write", "bash", "todo", "plan"]
         );
     }
 
@@ -3629,6 +4418,16 @@ mod tests {
             )))
         );
         assert_eq!(
+            parse_submission("/plan migrate storage safely".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Plan(
+                "migrate storage safely".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse_submission("/todo".to_owned()),
+            Ok(UserSubmission::Command(SlashCommand::Todo))
+        );
+        assert_eq!(
             parse_submission("/exit".to_owned()),
             Ok(UserSubmission::Command(SlashCommand::Exit))
         );
@@ -3650,7 +4449,7 @@ mod tests {
         let mut app = App::new(CoreSnapshot::default());
         app.input = "/".to_owned();
         assert!(app.slash_menu_visible());
-        assert_eq!(app.slash_candidate_count(), 3);
+        assert_eq!(app.slash_candidate_count(), 5);
 
         let action = handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
         assert!(matches!(action, KeyAction::None));
@@ -3684,7 +4483,7 @@ mod tests {
         app.follow_tail = true;
 
         let _ = handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.slash_selection, 2);
+        assert_eq!(app.slash_selection, 4);
         assert_eq!(app.scroll_offset, 20);
         assert!(app.follow_tail);
 
@@ -3713,6 +4512,71 @@ mod tests {
         ));
         assert!(!app.slash_menu_visible());
         assert_eq!(app.input, "/");
+    }
+
+    #[test]
+    fn todo_markdown_round_trips_human_edits() {
+        let phases = vec![CoreTodoPhase {
+            name: "Implementation".to_owned(),
+            tasks: vec![
+                CoreTodoItem {
+                    content: "Add protocol".to_owned(),
+                    status: "in_progress".to_owned(),
+                    blocker: None,
+                },
+                CoreTodoItem {
+                    content: "Run smoke test".to_owned(),
+                    status: "blocked".to_owned(),
+                    blocker: Some("mock server unavailable".to_owned()),
+                },
+            ],
+        }];
+        let document = todos_to_markdown(&phases);
+        assert_eq!(
+            parse_todos_markdown(&document).expect("todo document must parse"),
+            phases
+        );
+    }
+
+    #[test]
+    fn plan_review_accepts_feedback_and_approval_keys() {
+        let snapshot = CoreSnapshot {
+            phase: "waiting_plan_review".to_owned(),
+            plan: CorePlanState {
+                enabled: true,
+                revision: 2,
+                status: "review".to_owned(),
+                content: "# Plan".to_owned(),
+            },
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot.clone());
+        app.plan_review = true;
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut app
+            ),
+            KeyAction::None
+        ));
+        assert!(app.plan_feedback);
+        app.input = "Use bounded batches".to_owned();
+        match handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app) {
+            KeyAction::PlanReview(PlanReviewAction::Refine(feedback)) => {
+                assert_eq!(feedback, "Use bounded batches")
+            }
+            _ => panic!("plan feedback must dispatch a refine action"),
+        }
+
+        let mut approval_app = App::new(snapshot);
+        approval_app.plan_review = true;
+        assert!(matches!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                &mut approval_app
+            ),
+            KeyAction::PlanReview(PlanReviewAction::Approve)
+        ));
     }
 
     #[test]
@@ -4348,7 +5212,7 @@ mod tests {
             "└─ bash  git status --short",
             "└ Tool result",
             "Message · Enter send",
-            "Ready · pending 0 · steer 0 · safe 2",
+            "Ready · pending 0 · todos 0 · steer 0 · safe 2",
         ] {
             assert!(
                 screen.contains(expected),
@@ -4357,6 +5221,54 @@ mod tests {
         }
         assert!(!screen.contains("You"));
         assert!(!screen.contains("Assistant"));
+    }
+
+    #[test]
+    fn plan_review_renders_plan_and_todo_state() {
+        let snapshot = CoreSnapshot {
+            phase: "waiting_plan_review".to_owned(),
+            plan: CorePlanState {
+                enabled: true,
+                revision: 3,
+                status: "review".to_owned(),
+                content: "# Storage plan\n\nUse bounded migration batches.".to_owned(),
+            },
+            todos: vec![CoreTodoPhase {
+                name: "Migration".to_owned(),
+                tasks: vec![CoreTodoItem {
+                    content: "Verify rollback".to_owned(),
+                    status: "pending".to_owned(),
+                    blocker: None,
+                }],
+            }],
+            ..CoreSnapshot::default()
+        };
+        let mut app = App::new(snapshot);
+        app.plan_review = true;
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("plan review frame must draw");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "Plan review · y approve · r refine · e edit · n cancel",
+            "Storage plan",
+            "Use bounded migration batches.",
+            "Migration",
+            "Verify rollback",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "screen must contain {expected:?}"
+            );
+        }
     }
 
     #[test]

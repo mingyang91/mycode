@@ -4,7 +4,7 @@ open Lean
 
 namespace MyCode
 
-public def protocolVersion : Nat := 2
+public def protocolVersion : Nat := 3
 
 public structure ToolCall where
   callId : String
@@ -25,6 +25,7 @@ public inductive Phase where
   | waitingModel
   | waitingApproval (callId : String)
   | waitingTool (callId : String)
+  | waitingPlanReview
   deriving Inhabited, Repr, ToJson, FromJson
 
 public def Phase.label : Phase → String
@@ -32,6 +33,24 @@ public def Phase.label : Phase → String
   | .waitingModel => "waiting_model"
   | .waitingApproval _ => "waiting_approval"
   | .waitingTool _ => "waiting_tool"
+  | .waitingPlanReview => "waiting_plan_review"
+
+public structure TodoItem where
+  content : String
+  status : String := "pending"
+  blocker? : Option String := none
+  deriving BEq, Inhabited, ToJson, FromJson
+
+public structure TodoPhase where
+  name : String
+  tasks : Array TodoItem := #[]
+  deriving BEq, Inhabited, ToJson, FromJson
+public structure PlanState where
+  enabled : Bool := false
+  revision : Nat := 0
+  status : String := "none"
+  content : String := ""
+  deriving Inhabited, ToJson, FromJson
 
 public structure State where
   phase : Phase := .idle
@@ -41,6 +60,8 @@ public structure State where
   safeTools : Array String := #[]
   permissionMode : String := "ask"
   pendingSteers : Array String := #[]
+  plan : PlanState := {}
+  todos : Array TodoPhase := #[]
   deriving Inhabited, ToJson, FromJson
 
 public structure Event where
@@ -53,6 +74,7 @@ public structure Event where
   isError? : Option Bool := none
   safeTools : Array String := #[]
   permissionMode : String := "ask"
+  todos : Array TodoPhase := #[]
   deriving Inhabited, ToJson, FromJson
 
 public structure Effect where
@@ -68,6 +90,8 @@ public structure Snapshot where
   safeTools : Array String
   permissionMode : String
   pendingSteers : Array String
+  plan : PlanState
+  todos : Array TodoPhase
   deriving Inhabited, ToJson, FromJson
 
 public def State.snapshot (state : State) : Snapshot := {
@@ -78,6 +102,8 @@ public def State.snapshot (state : State) : Snapshot := {
   safeTools := state.safeTools
   permissionMode := state.permissionMode
   pendingSteers := state.pendingSteers
+  plan := state.plan
+  todos := state.todos
 }
 
 private def setDefaultField (json : Json) (name : String) (value : Json) : Json :=
@@ -89,7 +115,9 @@ public def State.fromJsonWithDefaults (json : Json) : Except String State :=
   let migrated := match json with
     | .obj _ =>
       let withPermission := setDefaultField json "permissionMode" (toJson "ask")
-      setDefaultField withPermission "pendingSteers" (toJson (#[] : Array String))
+      let withSteers := setDefaultField withPermission "pendingSteers" (toJson (#[] : Array String))
+      let withPlan := setDefaultField withSteers "plan" (toJson ({} : PlanState))
+      setDefaultField withPlan "todos" (toJson (#[] : Array TodoPhase))
     | _ => json
   fromJson? migrated
 
@@ -120,5 +148,7 @@ public def Effect.invokeTool (call : ToolCall) : Effect := {
   kind := "invoke_tool"
   call? := some call
 }
+
+public def Effect.requestPlanReview : Effect := { kind := "request_plan_review" }
 
 end MyCode
