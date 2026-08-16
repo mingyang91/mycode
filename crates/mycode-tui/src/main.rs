@@ -38,7 +38,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -67,8 +67,10 @@ const COLOR_TOOL: Color = Color::Rgb(250, 204, 21);
 const COLOR_TEXT: Color = Color::Rgb(228, 228, 231);
 const COLOR_MUTED: Color = Color::Rgb(113, 113, 122);
 const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
-const COLOR_USER_BACKGROUND: Color = Color::Rgb(13, 35, 47);
-const COLOR_ASSISTANT_BACKGROUND: Color = Color::Rgb(15, 36, 26);
+// Human messages are deliberately rendered as black-backed blocks. Assistant prose
+// uses the terminal's default background so it remains visually distinct from tools.
+const COLOR_USER_BACKGROUND: Color = Color::Black;
+const COLOR_ASSISTANT_BACKGROUND: Color = Color::Reset;
 const COLOR_TOOL_BACKGROUND: Color = Color::Rgb(42, 36, 13);
 const COLOR_ERROR_BACKGROUND: Color = Color::Rgb(49, 20, 24);
 const COLOR_MESSAGE_BACKGROUND: Color = Color::Rgb(30, 30, 34);
@@ -1595,6 +1597,11 @@ fn push_compact_text(
         }
     }
 }
+fn push_transcript_gap(lines: &mut Vec<Line<'static>>) {
+    if lines.last().is_some_and(|line| !line.spans.is_empty()) {
+        lines.push(Line::default());
+    }
+}
 
 fn push_human_message(
     lines: &mut Vec<Line<'static>>,
@@ -1618,6 +1625,7 @@ fn push_human_message(
                     background,
                     width,
                 );
+                push_transcript_gap(lines);
                 marked = true;
             }
             TranscriptContentPart::Code(code) => {
@@ -1743,7 +1751,7 @@ fn push_transcript_block(
         border_color,
         width,
     ));
-    lines.push(Line::default());
+    push_transcript_gap(lines);
 }
 
 struct LiveToolOutput {
@@ -2992,14 +3000,37 @@ async fn cancel_and_wait(active: &mut Option<ActiveRuntime>, app: &mut App) {
     app.status = "Cancelling…".to_owned();
     let _ = active.handle.await;
 }
+fn input_render_height(input: &str, width: u16, available_height: u16) -> u16 {
+    let content_width = usize::from(width.saturating_sub(2)).max(1);
+    let wrapped_lines = input
+        .split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                1
+            } else {
+                textwrap::wrap(line, content_width).len().max(1)
+            }
+        })
+        .sum::<usize>()
+        .max(1);
+    let desired = u16::try_from(wrapped_lines.saturating_add(2)).unwrap_or(u16::MAX);
+    desired.min(available_height.max(3)).max(3)
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let input_height = input_render_height(
+        &app.input,
+        area.width,
+        area.height.saturating_sub(1 + 4 + 1),
+    );
     let [header, transcript, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     let phase_color = match app.snapshot.phase.as_str() {
         "idle" => COLOR_ASSISTANT,
@@ -3048,6 +3079,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(
         Paragraph::new(app.input.as_str())
             .style(Style::default().fg(COLOR_TEXT))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3486,6 +3518,33 @@ mod tests {
     }
 
     #[test]
+    fn transcript_blocks_have_one_blank_line_between_them() {
+        let lines = build_transcript_lines(
+            &[
+                CoreMessage {
+                    role: "user".to_owned(),
+                    content: "request".to_owned(),
+                    ..CoreMessage::default()
+                },
+                CoreMessage {
+                    role: "assistant".to_owned(),
+                    content: "answer".to_owned(),
+                    ..CoreMessage::default()
+                },
+            ],
+            &[],
+            32,
+            true,
+        );
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].to_string().starts_with("> request"));
+        assert!(lines[1].spans.is_empty());
+        assert!(lines[2].to_string().starts_with("· answer"));
+        assert!(lines[3].spans.is_empty());
+    }
+
+    #[test]
     fn folds_long_commands_until_details_are_expanded() {
         let messages = [CoreMessage {
             role: "assistant".to_owned(),
@@ -3795,7 +3854,7 @@ mod tests {
             .draw(|frame| draw(frame, &mut app))
             .expect("padded transcript must draw");
 
-        let rendered_lines = 3_usize;
+        let rendered_lines = 5_usize;
         assert_eq!(app.max_scroll, rendered_lines.saturating_sub(app.page_rows));
         assert_eq!(app.scroll_offset, app.max_scroll);
         assert!(app.follow_tail);
