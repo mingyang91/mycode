@@ -186,12 +186,57 @@ enum AppError {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 enum SlashCommandError {
-    #[error("usage: /btw <question>")]
-    MissingBtwQuestion,
-    #[error("usage: /exit")]
-    ExitTakesNoArguments,
+    #[error("usage: {0}")]
+    InvalidUsage(&'static str),
     #[error("unknown slash command: /{0}")]
     Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlashCommandKind {
+    Btw,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlashCommandSpec {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    kind: SlashCommandKind,
+    takes_arguments: bool,
+}
+
+const SLASH_COMMANDS: [SlashCommandSpec; 2] = [
+    SlashCommandSpec {
+        name: "btw",
+        usage: "/btw <question>",
+        description: "Ask outside the main conversation",
+        kind: SlashCommandKind::Btw,
+        takes_arguments: true,
+    },
+    SlashCommandSpec {
+        name: "exit",
+        usage: "/exit",
+        description: "Exit MyCode cleanly",
+        kind: SlashCommandKind::Exit,
+        takes_arguments: false,
+    },
+];
+
+fn slash_command_prefix(input: &str) -> Option<&str> {
+    let command = input.strip_prefix('/')?;
+    if command.starts_with('/') || command.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(command)
+}
+
+fn slash_command_candidates(input: &str) -> impl Iterator<Item = &'static SlashCommandSpec> + '_ {
+    let prefix = slash_command_prefix(input);
+    SLASH_COMMANDS
+        .iter()
+        .filter(move |spec| prefix.is_some_and(|prefix| spec.name.starts_with(prefix)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -216,14 +261,21 @@ fn parse_submission(text: String) -> Result<UserSubmission, SlashCommandError> {
     let (name, arguments) = command
         .split_once(char::is_whitespace)
         .map_or((command, ""), |(name, arguments)| (name, arguments.trim()));
-    match name {
-        "btw" if arguments.is_empty() => Err(SlashCommandError::MissingBtwQuestion),
-        "btw" => Ok(UserSubmission::Command(SlashCommand::Btw(
+    let spec = SLASH_COMMANDS
+        .iter()
+        .find(|spec| spec.name == name)
+        .ok_or_else(|| SlashCommandError::Unknown(name.to_owned()))?;
+    match spec.kind {
+        SlashCommandKind::Btw if arguments.is_empty() => {
+            Err(SlashCommandError::InvalidUsage(spec.usage))
+        }
+        SlashCommandKind::Btw => Ok(UserSubmission::Command(SlashCommand::Btw(
             arguments.to_owned(),
         ))),
-        "exit" if arguments.is_empty() => Ok(UserSubmission::Command(SlashCommand::Exit)),
-        "exit" => Err(SlashCommandError::ExitTakesNoArguments),
-        name => Err(SlashCommandError::Unknown(name.to_owned())),
+        SlashCommandKind::Exit if arguments.is_empty() => {
+            Ok(UserSubmission::Command(SlashCommand::Exit))
+        }
+        SlashCommandKind::Exit => Err(SlashCommandError::InvalidUsage(spec.usage)),
     }
 }
 
@@ -2074,6 +2126,8 @@ fn build_transcript_lines(
 
 struct App {
     input: String,
+    slash_selection: usize,
+    slash_menu_dismissed: bool,
     status: String,
     snapshot: CoreSnapshot,
     approval: Option<CoreToolCall>,
@@ -2095,6 +2149,8 @@ impl App {
     fn new(snapshot: CoreSnapshot) -> Self {
         Self {
             input: String::new(),
+            slash_selection: 0,
+            slash_menu_dismissed: false,
             status: "Ready".to_owned(),
             snapshot,
             approval: None,
@@ -2111,6 +2167,73 @@ impl App {
             local_entries: Vec::new(),
             live_tool: None,
         }
+    }
+    fn slash_candidate_count(&self) -> usize {
+        slash_command_candidates(&self.input).count()
+    }
+
+    fn slash_menu_visible(&self) -> bool {
+        !self.slash_menu_dismissed && self.slash_candidate_count() > 0
+    }
+
+    fn input_changed(&mut self) {
+        self.slash_selection = 0;
+        self.slash_menu_dismissed = false;
+    }
+
+    fn push_input_character(&mut self, character: char) {
+        self.input.push(character);
+        self.input_changed();
+    }
+
+    fn pop_input_character(&mut self) {
+        self.input.pop();
+        self.input_changed();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_changed();
+    }
+
+    fn move_slash_selection(&mut self, previous: bool) -> bool {
+        if !self.slash_menu_visible() {
+            return false;
+        }
+        let count = self.slash_candidate_count();
+        self.slash_selection = if previous {
+            self.slash_selection.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (self.slash_selection + 1) % count
+        };
+        true
+    }
+
+    fn complete_selected_slash_command(&mut self) -> bool {
+        let Some(spec) = slash_command_candidates(&self.input)
+            .nth(self.slash_selection)
+            .copied()
+        else {
+            return false;
+        };
+        self.input.clear();
+        self.input.push('/');
+        self.input.push_str(spec.name);
+        if spec.takes_arguments {
+            self.input.push(' ');
+        }
+        self.slash_selection = 0;
+        self.slash_menu_dismissed = true;
+        true
+    }
+
+    fn dismiss_slash_menu(&mut self) -> bool {
+        if !self.slash_menu_visible() {
+            return false;
+        }
+        self.slash_selection = 0;
+        self.slash_menu_dismissed = true;
+        true
     }
 
     fn set_snapshot(&mut self, snapshot: CoreSnapshot) {
@@ -2690,6 +2813,13 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
         app.toggle_transcript_details();
         return KeyAction::None;
     }
+    if app.approval.is_none() {
+        match key.code {
+            KeyCode::Up if app.move_slash_selection(true) => return KeyAction::None,
+            KeyCode::Down if app.move_slash_selection(false) => return KeyAction::None,
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Up => {
             app.scroll_up(1);
@@ -2739,40 +2869,47 @@ fn handle_key(key: KeyEvent, app: &mut App) -> KeyAction {
             _ => KeyAction::None,
         };
     }
+    if matches!(key.code, KeyCode::Esc) && app.dismiss_slash_menu() {
+        return KeyAction::None;
+    }
     match key.code {
         KeyCode::Enter if !app.input.trim().is_empty() => {
             let parsed = parse_submission(app.input.clone());
             match parsed {
                 Ok(UserSubmission::Command(SlashCommand::Exit)) => {
-                    app.input.clear();
+                    app.clear_input();
                     KeyAction::Quit
                 }
                 Ok(_) | Err(_) if app.busy => KeyAction::None,
                 Ok(UserSubmission::Prompt(prompt)) => {
-                    app.input.clear();
+                    app.clear_input();
                     KeyAction::Submit(prompt)
                 }
                 Ok(UserSubmission::Command(SlashCommand::Btw(question))) => {
-                    app.input.clear();
+                    app.clear_input();
                     KeyAction::Btw(question)
                 }
                 Err(error) => {
-                    app.input.clear();
+                    app.clear_input();
                     app.status = format!("Error: {error}");
                     KeyAction::None
                 }
             }
         }
+        KeyCode::Tab => {
+            app.complete_selected_slash_command();
+            KeyAction::None
+        }
         KeyCode::Backspace => {
-            app.input.pop();
+            app.pop_input_character();
             KeyAction::None
         }
         KeyCode::Esc => {
-            app.input.clear();
+            app.clear_input();
             KeyAction::None
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.push(character);
+            app.push_input_character(character);
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -3016,17 +3153,67 @@ fn input_render_height(input: &str, width: u16, available_height: u16) -> u16 {
     let desired = u16::try_from(wrapped_lines.saturating_add(2)).unwrap_or(u16::MAX);
     desired.min(available_height.max(3)).max(3)
 }
+fn slash_candidate_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
+    let count = app.slash_candidate_count();
+    let rows = count.min(max_rows);
+    let start = app.slash_selection.saturating_add(1).saturating_sub(rows);
+    slash_command_candidates(&app.input)
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(index, spec)| {
+            let selected = index == app.slash_selection;
+            Line::from(vec![
+                Span::styled(
+                    if selected { " › " } else { "   " },
+                    Style::default()
+                        .fg(if selected { COLOR_ACCENT } else { COLOR_MUTED })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    spec.usage,
+                    Style::default().fg(COLOR_TEXT).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::raw("  "),
+                Span::styled(spec.description, Style::default().fg(COLOR_MUTED)),
+            ])
+        })
+        .collect()
+}
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let candidate_count = if app.approval.is_none() && app.slash_menu_visible() {
+        app.slash_candidate_count()
+    } else {
+        0
+    };
+    let max_candidate_height = area.height.saturating_sub(1 + 4 + 3 + 1);
+    let desired_candidate_height = u16::try_from(candidate_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let candidate_height = if candidate_count > 0 && max_candidate_height >= 3 {
+        desired_candidate_height.min(max_candidate_height)
+    } else {
+        0
+    };
     let input_height = input_render_height(
         &app.input,
         area.width,
-        area.height.saturating_sub(1 + 4 + 1),
+        area.height.saturating_sub(1 + 4 + candidate_height + 1),
     );
-    let [header, transcript, input, status] = Layout::vertical([
+    let [header, transcript, candidates, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
+        Constraint::Length(candidate_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
@@ -3067,6 +3254,24 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         Paragraph::new(visible_transcript).block(Block::default().padding(Padding::horizontal(1))),
         transcript,
     );
+    if candidate_height > 0 {
+        let candidate_rows = usize::from(candidates.height.saturating_sub(2));
+        frame.render_widget(
+            Paragraph::new(slash_candidate_lines(app, candidate_rows)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(COLOR_ACCENT))
+                    .title(Span::styled(
+                        " Slash commands · ↑↓ select · Tab complete · Esc close ",
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            ),
+            candidates,
+        );
+    }
 
     let (input_title, input_color) = match app.approval.as_ref() {
         Some(call) => (
@@ -3264,12 +3469,113 @@ mod tests {
         );
         assert_eq!(
             parse_submission("/btw".to_owned()),
-            Err(SlashCommandError::MissingBtwQuestion)
+            Err(SlashCommandError::InvalidUsage("/btw <question>")),
         );
         assert_eq!(
             parse_submission("/unknown".to_owned()),
             Err(SlashCommandError::Unknown("unknown".to_owned()))
         );
+    }
+    #[test]
+    fn slash_candidates_filter_and_tab_complete() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.input = "/".to_owned();
+        assert!(app.slash_menu_visible());
+        assert_eq!(app.slash_candidate_count(), 2);
+
+        let action = handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert!(matches!(action, KeyAction::None));
+        assert_eq!(app.slash_selection, 1);
+        let action = handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app);
+        assert!(matches!(action, KeyAction::None));
+        assert_eq!(app.input, "/exit");
+        assert!(!app.slash_menu_visible());
+
+        app.input = "/b".to_owned();
+        app.input_changed();
+        assert_eq!(app.slash_candidate_count(), 1);
+        let _ = handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.input, "/btw ");
+        assert_eq!(app.slash_candidate_count(), 0);
+
+        app.input = "//".to_owned();
+        app.input_changed();
+        assert!(!app.slash_menu_visible());
+        app.input = "/btw question".to_owned();
+        app.input_changed();
+        assert!(!app.slash_menu_visible());
+    }
+
+    #[test]
+    fn slash_navigation_precedes_scrolling() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.input = "/".to_owned();
+        app.max_scroll = 20;
+        app.scroll_offset = 20;
+        app.follow_tail = true;
+
+        let _ = handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.slash_selection, 1);
+        assert_eq!(app.scroll_offset, 20);
+        assert!(app.follow_tail);
+
+        let _ = handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.slash_selection, 0);
+        assert_eq!(app.scroll_offset, 20);
+    }
+
+    #[test]
+    fn busy_escape_cancels_before_dismissing_slash_menu() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.input = "/".to_owned();
+        app.busy = true;
+
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app),
+            KeyAction::Cancel
+        ));
+        assert!(app.slash_menu_visible());
+        assert_eq!(app.input, "/");
+
+        app.busy = false;
+        assert!(matches!(
+            handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app),
+            KeyAction::None
+        ));
+        assert!(!app.slash_menu_visible());
+        assert_eq!(app.input, "/");
+    }
+
+    #[test]
+    fn slash_candidate_menu_renders_command_usage_and_help() {
+        let mut app = App::new(CoreSnapshot::default());
+        app.input = "/".to_owned();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal must initialize");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("slash candidate frame must draw");
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        for expected in [
+            "Slash commands",
+            "Tab complete",
+            "/btw <question>",
+            "Ask outside the main conversation",
+            "/exit",
+            "Exit MyCode cleanly",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "candidate menu must contain {expected:?}"
+            );
+        }
     }
 
     #[test]
