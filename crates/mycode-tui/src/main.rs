@@ -80,6 +80,7 @@ const COLOR_TOOL_BACKGROUND: Color = Color::Rgb(42, 36, 13);
 // File contents are code-like output. Keep this deliberately plain until syntax
 // highlighting is added; the black surface also separates it from command output.
 const COLOR_FILE_BACKGROUND: Color = Color::Black;
+const COLOR_GREP_BACKGROUND: Color = Color::Rgb(18, 34, 48);
 const COLOR_ERROR_BACKGROUND: Color = Color::Rgb(49, 20, 24);
 const COLOR_MESSAGE_BACKGROUND: Color = Color::Rgb(30, 30, 34);
 const COLLAPSED_LIVE_TAIL_LINES: usize = 4;
@@ -389,12 +390,37 @@ impl CoreToolCall {
     }
 
     fn transcript_summary(&self) -> String {
+        if self.name == "grep" {
+            let pattern = self
+                .arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let path = self
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".");
+            let case = self
+                .arguments
+                .get("caseSensitive")
+                .and_then(Value::as_bool)
+                .map_or("", |case_sensitive| {
+                    if case_sensitive {
+                        ""
+                    } else {
+                        " · ignore case"
+                    }
+                });
+            return format!("grep  🔎 /{pattern}/  {path}{case}");
+        }
         let path_summary =
             self.arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .map(|path| match self.name.as_str() {
                     "read" => format!("read  📄 {path}"),
+                    "grep" => format!("grep  🔎 {path}"),
                     "write" => format!("write  📝 {path}"),
                     "edit" => format!("edit  ✎ {path}"),
                     _ => String::new(),
@@ -2279,6 +2305,25 @@ fn build_live_tool_lines(live: &LiveToolOutput, width: u16, expanded: bool) -> V
     style_transcript_block(block, COLOR_TOOL_BACKGROUND, COLOR_TOOL, width)
 }
 
+fn build_grep_result_lines(content: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let available = usize::from(width).saturating_sub(2).max(1);
+    let mut lines = Vec::new();
+    for result in content.lines().filter(|line| !line.trim().is_empty()) {
+        let wrapped = textwrap::wrap(result, available);
+        for (index, row) in wrapped.iter().enumerate() {
+            let prefix = if index == 0 { "  • " } else { "    " };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                Span::styled(row.clone().into_owned(), style),
+            ]));
+        }
+    }
+    lines
+}
+
 fn build_completed_bash_tail(content: &str, width: u16) -> Vec<Line<'static>> {
     let (stdout, stderr) = content
         .split_once("\n[stderr]\n")
@@ -2328,7 +2373,12 @@ fn push_folded_lines(
     }
 }
 
-fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u16, expanded: bool) {
+fn append_tool_call_lines(
+    lines: &mut Vec<Line<'static>>,
+    call: &CoreToolCall,
+    width: u16,
+    expanded: bool,
+) {
     if width == 0 {
         return;
     }
@@ -2395,6 +2445,103 @@ fn push_tool_call(lines: &mut Vec<Line<'static>>, call: &CoreToolCall, width: u1
     }
 }
 
+fn build_tool_transcript_block(
+    calls: &[&CoreToolCall],
+    result: Option<&CoreMessage>,
+    width: u16,
+    details_expanded: bool,
+) -> (Vec<Line<'static>>, Color, Color) {
+    let content_width = transcript_block_content_width(width);
+    let is_file_result = result
+        .is_some_and(|message| calls.iter().any(|call| call.name == "read") && !message.is_error);
+    let is_grep_result = result
+        .is_some_and(|message| calls.iter().any(|call| call.name == "grep") && !message.is_error);
+    let is_todo_result = result
+        .is_some_and(|message| calls.iter().any(|call| call.name == "todo") && !message.is_error);
+    let is_error = result.is_some_and(|message| message.is_error);
+    let (border_color, content_color, background) = if is_error {
+        (COLOR_ERROR, COLOR_ERROR, COLOR_ERROR_BACKGROUND)
+    } else if is_file_result {
+        (COLOR_TOOL, Color::Rgb(161, 161, 170), COLOR_FILE_BACKGROUND)
+    } else if is_grep_result {
+        (
+            Color::Rgb(56, 189, 248),
+            Color::Rgb(186, 230, 253),
+            COLOR_GREP_BACKGROUND,
+        )
+    } else {
+        (COLOR_TOOL, Color::Rgb(161, 161, 170), COLOR_TOOL_BACKGROUND)
+    };
+    let mut block = Vec::new();
+    for call in calls {
+        append_tool_call_lines(&mut block, call, content_width, details_expanded);
+    }
+    if let Some(message) = result {
+        let label = if is_error {
+            "! Tool error"
+        } else if is_file_result {
+            "└ File result"
+        } else if is_grep_result {
+            "└ Search results"
+        } else {
+            "└ Tool result"
+        };
+        push_wrapped_line(
+            &mut block,
+            label,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+            content_width,
+        );
+        if !message.content.is_empty() {
+            if is_todo_result {
+                block.push(Line::from(Span::styled(
+                    "  ✓ task list updated",
+                    Style::default().fg(content_color),
+                )));
+            } else if calls.iter().any(|call| call.name == "bash") && !details_expanded {
+                block.extend(build_completed_bash_tail(&message.content, content_width));
+            } else if is_grep_result {
+                let result_lines = build_grep_result_lines(
+                    &message.content,
+                    Style::default().fg(content_color),
+                    content_width,
+                );
+                push_folded_lines(
+                    &mut block,
+                    result_lines,
+                    details_expanded,
+                    COLLAPSED_FILE_OUTPUT_LINES,
+                    "search result",
+                    true,
+                );
+            } else {
+                let content_lines = indented_wrapped_lines(
+                    &message.content,
+                    Style::default().fg(content_color),
+                    content_width,
+                );
+                push_folded_lines(
+                    &mut block,
+                    content_lines,
+                    details_expanded,
+                    COLLAPSED_FILE_OUTPUT_LINES,
+                    if is_file_result {
+                        "file output"
+                    } else if is_grep_result {
+                        "search result"
+                    } else {
+                        "tool output"
+                    },
+                    !is_file_result && !is_todo_result,
+                );
+            }
+        }
+    }
+    (block, background, border_color)
+}
+
 fn build_transcript_lines(
     messages: &[CoreMessage],
     local_entries: &[LocalTranscriptEntry],
@@ -2409,8 +2556,16 @@ fn build_transcript_lines(
             .tool_call_id
             .as_deref()
             .and_then(|call_id| tool_calls.get(call_id));
-        let is_file_result =
-            message.role == "tool" && source_call.is_some_and(|call| call.name == "read");
+        if message.role == "tool" {
+            let calls: Vec<&CoreToolCall> = match source_call {
+                Some(call) => vec![call],
+                None => Vec::new(),
+            };
+            let (block, background, border_color) =
+                build_tool_transcript_block(&calls, Some(message), content_width, details_expanded);
+            push_transcript_block(&mut lines, block, background, border_color, width);
+            continue;
+        }
         match message.role.as_str() {
             "user" => push_human_message(
                 &mut lines,
@@ -2421,78 +2576,41 @@ fn build_transcript_lines(
                 COLOR_USER_BACKGROUND,
                 width,
             ),
-            "assistant" => push_human_message(
-                &mut lines,
-                &message.content,
-                "· ",
-                COLOR_ASSISTANT,
-                COLOR_TEXT,
-                COLOR_ASSISTANT_BACKGROUND,
-                width,
-            ),
-            "tool" => {
-                let (label, color, content_color, background) = if message.is_error {
-                    (
-                        "! Tool error",
-                        COLOR_ERROR,
-                        COLOR_ERROR,
-                        COLOR_ERROR_BACKGROUND,
-                    )
-                } else if is_file_result {
-                    (
-                        "└ File result",
-                        COLOR_TOOL,
-                        Color::Rgb(161, 161, 170),
-                        COLOR_FILE_BACKGROUND,
-                    )
-                } else {
-                    (
-                        "└ Tool result",
-                        COLOR_TOOL,
-                        Color::Rgb(161, 161, 170),
-                        COLOR_TOOL_BACKGROUND,
-                    )
-                };
-                let mut block = Vec::new();
-                push_wrapped_line(
-                    &mut block,
-                    label,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    content_width,
-                );
+            "assistant" => {
                 if !message.content.is_empty() {
-                    let is_bash_result = source_call.is_some_and(|call| call.name == "bash");
-                    let is_todo_result = source_call.is_some_and(|call| call.name == "todo");
-                    if is_todo_result {
-                        block.push(Line::from(Span::styled(
-                            "  ✓ task list updated",
-                            Style::default().fg(content_color),
-                        )));
-                    } else if is_bash_result && !details_expanded {
-                        block.extend(build_completed_bash_tail(&message.content, content_width));
-                    } else {
-                        let content_lines = indented_wrapped_lines(
-                            &message.content,
-                            Style::default().fg(content_color),
+                    push_human_message(
+                        &mut lines,
+                        &message.content,
+                        "· ",
+                        COLOR_ASSISTANT,
+                        COLOR_TEXT,
+                        COLOR_ASSISTANT_BACKGROUND,
+                        width,
+                    );
+                }
+                if !message.tool_calls.is_empty() {
+                    let calls = message
+                        .tool_calls
+                        .iter()
+                        .filter(|call| {
+                            !(call.name == "grep"
+                                && messages.iter().any(|result| {
+                                    result.role == "tool"
+                                        && result.tool_call_id.as_deref()
+                                            == Some(call.call_id.as_str())
+                                }))
+                        })
+                        .collect::<Vec<_>>();
+                    if !calls.is_empty() {
+                        let (block, background, border_color) = build_tool_transcript_block(
+                            &calls,
+                            None,
                             content_width,
-                        );
-                        push_folded_lines(
-                            &mut block,
-                            content_lines,
                             details_expanded,
-                            COLLAPSED_FILE_OUTPUT_LINES,
-                            if is_file_result {
-                                "file output"
-                            } else if is_todo_result {
-                                "todo output"
-                            } else {
-                                "tool output"
-                            },
-                            !is_file_result && !is_todo_result,
                         );
+                        push_transcript_block(&mut lines, block, background, border_color, width);
                     }
                 }
-                push_transcript_block(&mut lines, block, background, color, width);
             }
             _ => push_human_message(
                 &mut lines,
@@ -2503,13 +2621,6 @@ fn build_transcript_lines(
                 COLOR_MESSAGE_BACKGROUND,
                 width,
             ),
-        }
-        if !message.tool_calls.is_empty() {
-            let mut block = Vec::new();
-            for call in &message.tool_calls {
-                push_tool_call(&mut block, call, content_width, details_expanded);
-            }
-            push_transcript_block(&mut lines, block, COLOR_TOOL_BACKGROUND, COLOR_TOOL, width);
         }
         for call in &message.tool_calls {
             tool_calls.insert(call.call_id.as_str(), call);
@@ -5584,6 +5695,22 @@ mod tests {
             arguments: serde_json::json!({"path": "src/main.rs", "oldText": "secret"}),
         };
         assert!(edit.transcript_summary().contains("✎ src/main.rs"));
+
+        let grep = CoreToolCall {
+            call_id: "grep".to_owned(),
+            name: "grep".to_owned(),
+            arguments: serde_json::json!({
+                "pattern": "fn main",
+                "path": "src",
+                "caseSensitive": false,
+                "maxResults": 10
+            }),
+        };
+        assert_eq!(
+            grep.transcript_summary(),
+            "grep  🔎 /fn main/  src · ignore case"
+        );
+        assert!(!grep.transcript_summary().contains("maxResults"));
     }
 
     #[test]
@@ -5632,6 +5759,47 @@ mod tests {
         assert!(rendered.contains("📄 src/main.rs"));
         assert!(rendered.contains("✓ task list updated"));
         assert!(!rendered.contains("hidden"));
+    }
+    #[test]
+    fn grep_results_use_search_blocks_and_hide_raw_arguments() {
+        let messages = [
+            CoreMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![CoreToolCall {
+                    call_id: "grep".to_owned(),
+                    name: "grep".to_owned(),
+                    arguments: serde_json::json!({
+                        "pattern": "fn main",
+                        "path": "src",
+                        "caseSensitive": false,
+                        "maxResults": 10
+                    }),
+                }],
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("grep".to_owned()),
+                content: "src/main.rs:1:fn main() {}".to_owned(),
+                ..CoreMessage::default()
+            },
+        ];
+        let lines = build_transcript_lines(&messages, &[], 80, true);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let match_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("src/main.rs:1"))
+            .expect("grep result must render");
+        assert_eq!(match_line.style.bg, Some(super::COLOR_GREP_BACKGROUND));
+        assert!(rendered.contains("🔎 /fn main/  src · ignore case"));
+        assert!(rendered.contains("└ Search results"));
+        assert!(rendered.contains("  • src/main.rs:1:fn main() {}"));
+        assert!(!rendered.contains("maxResults"));
+        assert!(!rendered.contains("caseSensitive"));
     }
     #[test]
     fn parses_complete_openai_function_calls() {
