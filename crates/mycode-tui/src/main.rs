@@ -77,6 +77,9 @@ const COLOR_ERROR: Color = Color::Rgb(248, 113, 113);
 const COLOR_USER_BACKGROUND: Color = Color::Black;
 const COLOR_ASSISTANT_BACKGROUND: Color = Color::Reset;
 const COLOR_TOOL_BACKGROUND: Color = Color::Rgb(42, 36, 13);
+// File contents are code-like output. Keep this deliberately plain until syntax
+// highlighting is added; the black surface also separates it from command output.
+const COLOR_FILE_BACKGROUND: Color = Color::Black;
 const COLOR_ERROR_BACKGROUND: Color = Color::Rgb(49, 20, 24);
 const COLOR_MESSAGE_BACKGROUND: Color = Color::Rgb(30, 30, 34);
 const COLLAPSED_LIVE_TAIL_LINES: usize = 4;
@@ -386,8 +389,22 @@ impl CoreToolCall {
     }
 
     fn transcript_summary(&self) -> String {
+        let path_summary =
+            self.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| match self.name.as_str() {
+                    "read" => format!("read  📄 {path}"),
+                    "write" => format!("write  📝 {path}"),
+                    "edit" => format!("edit  ✎ {path}"),
+                    _ => String::new(),
+                });
+        if let Some(summary) = path_summary.filter(|summary| !summary.is_empty()) {
+            return summary;
+        }
         match self.arguments.get("command").and_then(Value::as_str) {
             Some(command) => format!("{}  {command}", self.name),
+            None if self.name == "todo" => format!("{}  update task list", self.name),
             None => format!("{}  {}", self.name, self.arguments),
         }
     }
@@ -495,7 +512,7 @@ struct CoreEvent {
 }
 
 fn default_permission_mode() -> String {
-    "ask".to_owned()
+    "auto".to_owned()
 }
 
 impl CoreEvent {
@@ -509,7 +526,7 @@ impl CoreEvent {
             content: None,
             is_error: None,
             safe_tools: Vec::new(),
-            permission_mode: "ask".to_owned(),
+            permission_mode: "auto".to_owned(),
             todos: Vec::new(),
             input_tokens: 0,
             automatic: false,
@@ -639,7 +656,7 @@ struct CoreEffect {
     call: Option<CoreToolCall>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CoreSnapshot {
     phase: String,
@@ -660,6 +677,22 @@ struct CoreSnapshot {
     todos: Vec<CoreTodoPhase>,
     #[serde(default)]
     compaction: CoreCompactionState,
+}
+impl Default for CoreSnapshot {
+    fn default() -> Self {
+        Self {
+            phase: String::new(),
+            messages: Vec::new(),
+            pending_calls: Vec::new(),
+            current_call: 0,
+            safe_tools: Vec::new(),
+            permission_mode: default_permission_mode(),
+            pending_steers: Vec::new(),
+            plan: CorePlanState::default(),
+            todos: Vec::new(),
+            compaction: CoreCompactionState::default(),
+        }
+    }
 }
 
 fn snapshot_accepts_steer(snapshot: &CoreSnapshot) -> bool {
@@ -2410,7 +2443,7 @@ fn build_transcript_lines(
                         "└ File result",
                         COLOR_TOOL,
                         Color::Rgb(161, 161, 170),
-                        COLOR_TOOL_BACKGROUND,
+                        COLOR_FILE_BACKGROUND,
                     )
                 } else {
                     (
@@ -2429,7 +2462,13 @@ fn build_transcript_lines(
                 );
                 if !message.content.is_empty() {
                     let is_bash_result = source_call.is_some_and(|call| call.name == "bash");
-                    if is_bash_result && !details_expanded {
+                    let is_todo_result = source_call.is_some_and(|call| call.name == "todo");
+                    if is_todo_result {
+                        block.push(Line::from(Span::styled(
+                            "  ✓ task list updated",
+                            Style::default().fg(content_color),
+                        )));
+                    } else if is_bash_result && !details_expanded {
                         block.extend(build_completed_bash_tail(&message.content, content_width));
                     } else {
                         let content_lines = indented_wrapped_lines(
@@ -2444,10 +2483,12 @@ fn build_transcript_lines(
                             COLLAPSED_FILE_OUTPUT_LINES,
                             if is_file_result {
                                 "file output"
+                            } else if is_todo_result {
+                                "todo output"
                             } else {
                                 "tool output"
                             },
-                            !is_file_result,
+                            !is_file_result && !is_todo_result,
                         );
                     }
                 }
@@ -5528,6 +5569,71 @@ mod tests {
     };
 
     #[test]
+    fn tool_summaries_hide_todo_json_and_show_file_paths() {
+        let todo = CoreToolCall {
+            call_id: "todo".to_owned(),
+            name: "todo".to_owned(),
+            arguments: serde_json::json!({"op": "done", "task": "secret details"}),
+        };
+        assert_eq!(todo.transcript_summary(), "todo  update task list");
+        assert!(!todo.transcript_summary().contains("secret details"));
+
+        let edit = CoreToolCall {
+            call_id: "edit".to_owned(),
+            name: "edit".to_owned(),
+            arguments: serde_json::json!({"path": "src/main.rs", "oldText": "secret"}),
+        };
+        assert!(edit.transcript_summary().contains("✎ src/main.rs"));
+    }
+
+    #[test]
+    fn read_results_use_black_code_blocks_and_todo_results_are_summarized() {
+        let messages = [
+            CoreMessage {
+                role: "assistant".to_owned(),
+                tool_calls: vec![
+                    CoreToolCall {
+                        call_id: "read".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({"path": "src/main.rs"}),
+                    },
+                    CoreToolCall {
+                        call_id: "todo".to_owned(),
+                        name: "todo".to_owned(),
+                        arguments: serde_json::json!({"op": "done", "task": "hidden"}),
+                    },
+                ],
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("read".to_owned()),
+                content: "fn main() {}".to_owned(),
+                ..CoreMessage::default()
+            },
+            CoreMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("todo".to_owned()),
+                content: "{\"todos\": [\"hidden\"]}".to_owned(),
+                ..CoreMessage::default()
+            },
+        ];
+        let lines = build_transcript_lines(&messages, &[], 80, true);
+        let read_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .expect("read output must render");
+        assert_eq!(read_line.style.bg, Some(super::COLOR_FILE_BACKGROUND));
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("📄 src/main.rs"));
+        assert!(rendered.contains("✓ task list updated"));
+        assert!(!rendered.contains("hidden"));
+    }
+    #[test]
     fn parses_complete_openai_function_calls() {
         let calls = serde_json::json!([{
             "id": "call_1",
@@ -5682,7 +5788,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_resume_without_permission_flag_preserves_snapshot_permission() {
+    fn startup_permission_defaults_to_auto_and_preserves_restored_sessions() {
         let implicit = Args::try_parse_from([
             "mycode-tui",
             "--provider",
@@ -5713,6 +5819,8 @@ mod tests {
             permission_mode: "ask".to_owned(),
             ..CoreSnapshot::default()
         };
+        assert_eq!(CoreSnapshot::default().permission_mode, "auto");
+        assert_eq!(CoreEvent::new("abort").permission_mode, "auto");
 
         assert_eq!(
             startup_permission_mode(true, implicit.permission_mode, &snapshot),
