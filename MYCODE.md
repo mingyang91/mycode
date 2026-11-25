@@ -2,24 +2,30 @@
 
 Native coding agent with a Lean 4 decision core and a Rust Ratatui/Crossterm shell. Node.js and TypeScript are out of scope.
 
+## How to use
+
+Before changing anything, find it in "Which file to read before changing which kind of file" below and read that topic file in full: use `read` to read all of it, not `grep`, `sed`, or a partial range. Read one file for each area a change touches. For read-only research that changes no code, read until you have enough.
+
+When creating a new file, find the row for its directory in the table; if none fits, read `docs/agents/architecture.md`.
+
+The sections below (Architecture, Lean rules, Rust rules, Verification, Git) apply to every change. Topic files are named by plain path, not `@`-imported.
+
+## Which file to read before changing which kind of file
+
+| Change | Typical paths | Read first |
+|---|---|---|
+| Lean core | `mycode/MyCode/`, `mycode/*.lean` | `docs/agents/architecture.md` |
+| TUI and provider adapters | `crates/mycode-tui/` | `docs/agents/architecture.md` |
+| Plugin wire contract | `crates/mycode-plugin-protocol/` | `docs/agents/architecture.md` |
+| Workspace plugin | `crates/mycode-workspace-plugin/` | `docs/agents/architecture.md` |
+| Build and lint config | `Cargo.toml`, `clippy.toml`, `mycode/lakefile.toml`, `mycode/lean-toolchain` | Rust rules and Verification below |
+| This index or a topic file | `MYCODE.md`, `docs/agents/*.md` | `docs/agents/architecture.md` |
+
 ## Architecture
 
-- `mycode/` owns the authoritative agent state machine, tool ordering, approval decisions, session snapshots, and restart recovery.
-- `crates/mycode-tui/` owns terminal input/rendering, direct OpenAI and Anthropic adapters, the OMP-backed Linewise OpenAI gateway adapter, and asynchronous realization of Lean effects.
-- `crates/mycode-plugin-protocol/` owns the versioned external-plugin wire contract: four-byte big-endian length followed by bounded UTF-8 JSON.
-- `crates/mycode-workspace-plugin/` is the first-party workspace plugin. `read` and `grep` are always safe; Lean permission modes decide whether `write`, `edit`, and `bash` run automatically or require approval. Bash emits bounded, correlated stdout/stderr progress frames before its terminal result.
 - Rust must never execute a model-proposed tool merely because it parsed a provider response. It may invoke a plugin only after the Lean core emits `invoke_tool`.
 - Provider payloads and plugin output are untrusted observations. Validate names, framing, sizes, correlation IDs, paths, and JSON before sending normalized events to Lean.
 - Provider and plugin effects run off the terminal event loop. Cancellation is cooperative: never abort a task while a `CoreClient` request may be in flight; retire ambiguous plugin transports and close every pending tool call through Lean before accepting another prompt.
-- Steer belongs to the main Lean state, unlike the independent BTW sidechain. A steer replaces an in-flight model request; during a tool it is persisted until the current result is known, then Lean synthesizes results for every skipped tool before appending the new user instruction.
-- Plan and todo are built-in control state, not plugin effects. Lean owns the canonical Markdown plan, its revision and review phase, plus phased todo items. In plan mode Lean permits only configured safe tools and closed read-only commands, even under `yolo`.
-- `/plan <goal>` starts read-only planning. The model updates todos and submits a Markdown plan through the built-in `plan` tool; the TUI lets the user approve, refine, cancel, or edit it with `$VISUAL`/`$EDITOR`. `/todo` round-trips the same canonical todo state through a bounded Markdown editor.
-- Compaction is built-in control state. Lean preserves the complete canonical transcript, chooses user-turn cut points, persists pending compaction before emitting `request_compaction`, and stores the bounded summary plus the first kept message. Rust sends providers only the latest summary and retained suffix.
-- `/compact [instructions]` runs manual context compaction. Automatic compaction uses provider-reported input tokens before a model request and after a completed turn, recovers classified context-overflow responses, and clears its trigger after success or failure to prevent retry loops.
-- Permission policy is Lean-owned. `ask` permits only configured safe tools, `auto` additionally permits closed read-only commands (`pwd`, and non-dereferencing `ls` in the current directory), and `yolo` permits every declared tool.
-- The TUI renders live command stdout/stderr tails while details are collapsed. `Ctrl+O` toggles the complete command and tool output.
-- Transcript text is mouse-selectable while mouse-wheel scrolling remains active. A left-button drag highlights and copies through OSC 52; double-click selects a code word, `Ctrl`+double-click selects one visual line, and triple-click selects the contiguous paragraph block. Copied text excludes rounded box borders, and a click without a drag leaves the clipboard unchanged.
-- The input editor keeps a Unicode grapheme cursor and a cursor-following wrapped viewport. `Left`/`Right` move by grapheme; `Alt`/`Ctrl` plus arrows and `Alt+B`/`Alt+F` move by code word; `Ctrl+B`/`Ctrl+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, `Delete`, `Ctrl+W`, and `Alt+Backspace` provide readline-style editing.
 
 ## Lean rules
 
